@@ -1787,24 +1787,6 @@ const streamReply = async (sessionId: string, initial: AssistantMessage, request
         reply = { ...reply, ...(latestReminder ? { latestReminder } : {}) }
         updateReply(sessionId, reply)
         persist(sessionId)
-        const builtRequest = toRequestMessagesWithSources(
-          prepared.history,
-          inlinePrepared.question,
-          prepared.prefix,
-          initial.thinking ?? false,
-          latestReminder,
-          settings.allowRefusedContext,
-          settings.chatProtocol !== 'deepseek',
-          {
-            skipFileIds: skippedHistoryFileIds,
-            skipRoundUserIds,
-            stripReadLinkAssistantIds,
-            dropLeadingRounds,
-          }
-        )
-        const messages = builtRequest.messages
-        builtSourceEntries = builtRequest.sourceEntries
-        builtRoundCount = builtRequest.roundCount
         const baseSystem = settings.systemPrompt.trim()
         const voiceSystem = request.voiceCall ? settings.voiceSystemPrompt.trim() : ''
         const visionHint =
@@ -1832,16 +1814,47 @@ const streamReply = async (sessionId: string, initial: AssistantMessage, request
           reply = settleReply(reply, 'stopped', Date.now(), undefined, settings.keepRefusedContent)
           break
         }
-        const system = [
-          baseSystem,
-          voiceSystem,
-          visionHint,
-          imageGenHint,
-          savedMemoryContext,
-          memoryContext,
+        // 缓存铁律：system 和已保存的历史轮次必须逐字节稳定。
+        // system 位于请求最前面，只要它变化一个字符，服务端前缀 KV 缓存（prompt cache）
+        // 就会从第一个 token 起全部失效，整段历史都要按未命中价重算。
+        // 因此每轮会变的上下文（长期记忆、跨对话检索、实时画面提示）一律前置到本轮用户消息，
+        // 只让「最后一条消息」不可缓存，system 与历史全部命中缓存。
+        const turnContext = [
+          visionHint ? `<live_vision_hint>\n${visionHint}\n</live_vision_hint>` : '',
+          savedMemoryContext
+            ? `<long_term_memory>\n${savedMemoryContext}\n</long_term_memory>`
+            : '',
+          memoryContext ? `<cross_chat_memory>\n${memoryContext}\n</cross_chat_memory>` : '',
         ]
           .filter(Boolean)
           .join('\n\n')
+        const outboundQuestion = turnContext
+          ? {
+              ...inlinePrepared.question,
+              content: inlinePrepared.question.content
+                ? `${turnContext}\n\n${inlinePrepared.question.content}`
+                : turnContext,
+            }
+          : inlinePrepared.question
+        const builtRequest = toRequestMessagesWithSources(
+          prepared.history,
+          outboundQuestion,
+          prepared.prefix,
+          initial.thinking ?? false,
+          latestReminder,
+          settings.allowRefusedContext,
+          settings.chatProtocol !== 'deepseek',
+          {
+            skipFileIds: skippedHistoryFileIds,
+            skipRoundUserIds,
+            stripReadLinkAssistantIds,
+            dropLeadingRounds,
+          }
+        )
+        const messages = builtRequest.messages
+        builtSourceEntries = builtRequest.sourceEntries
+        builtRoundCount = builtRequest.roundCount
+        const system = [baseSystem, voiceSystem, imageGenHint].filter(Boolean).join('\n\n')
         const tools = serverTools(initial.search ?? false, settings.readUrl)
         const requestBody: CreateMessageRequest = {
           model: initial.model ?? (settings.model.trim() || MODEL),
