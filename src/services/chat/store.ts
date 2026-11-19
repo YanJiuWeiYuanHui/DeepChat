@@ -553,7 +553,8 @@ export const renameSession = (id: string, title: string) => {
   }
 }
 
-export const togglePinSession = (id: string) => {
+/** 把单个会话设成置顶或取消置顶；批量置顶也走这里。 */
+const applySessionPin = (id: string, pinned: boolean) => {
   if (get().importingHistory || deletingSessions.has(id)) {
     return
   }
@@ -561,7 +562,7 @@ export const togglePinSession = (id: string) => {
   if (!currentSummary) {
     return
   }
-  const nextPinnedAt = currentSummary.pinnedAt ? undefined : Date.now()
+  const nextPinnedAt = pinned ? (currentSummary.pinnedAt ?? Date.now()) : undefined
   if (getSession(id)) {
     updateSession(id, (session) => ({ ...session, pinnedAt: nextPinnedAt }))
     persist(id)
@@ -577,6 +578,24 @@ export const togglePinSession = (id: string) => {
   }
 }
 
+export const togglePinSession = (id: string) => {
+  applySessionPin(id, !get().sessions.find((session) => session.id === id)?.pinnedAt)
+}
+
+/** 批量置顶 / 取消置顶；已置顶的会话保留原置顶时间，顺序不会跳。 */
+export const setSessionsPinned = (ids: string[], pinned: boolean) => {
+  for (const id of ids) {
+    applySessionPin(id, pinned)
+  }
+}
+
+/** 批量反转置顶：已置顶的取消、未置顶的置顶，各条互不影响。 */
+export const toggleSessionsPin = (ids: string[]) => {
+  for (const id of ids) {
+    applySessionPin(id, !get().sessions.find((session) => session.id === id)?.pinnedAt)
+  }
+}
+
 /**
  * 删除会话；本地原件仅在没有其他会话引用时清理。远端文件不删：导入、编辑、重新生成都会复用同一个附件，
  * 同一服务端文件可能被多个会话引用，不维护引用计数。
@@ -585,6 +604,17 @@ export const removeSession = (id: string): Promise<boolean> => {
   const task = removeSessionData(id).finally(() => deletionTasks.delete(task))
   deletionTasks.add(task)
   return task
+}
+
+/** 批量删除；逐个走单条逻辑，保留流中止、待写回拦截与附件引用清理。 */
+export const removeSessions = async (ids: string[]): Promise<boolean> => {
+  let ok = true
+  for (const id of ids) {
+    if (!(await removeSession(id))) {
+      ok = false
+    }
+  }
+  return ok
 }
 
 const removeSessionData = async (id: string): Promise<boolean> => {

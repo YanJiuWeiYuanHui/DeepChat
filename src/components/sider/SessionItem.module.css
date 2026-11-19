@@ -95,3 +95,45 @@
   color: var(--dsw-alias-brand-primary);
   opacity: 0.78;
 }
+
+.selected {
+  background-color: var(--dsw-specific-sidebar-nav-item-active-accent);
+  color: var(--dsw-alias-brand-primary-invert);
+}
+
+/* 判定区比圆圈大得多，手指划过时更容易命中，视觉大小不变 */
+.checkArea {
+  display: inline-flex;
+  flex-shrink: 0;
+  align-items: center;
+  box-sizing: border-box;
+  width: 40px;
+  padding: 11px 0;
+  margin-left: -8px;
+  margin-right: 2px;
+}
+
+.checkbox {
+  display: inline-flex;
+  flex-shrink: 0;
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
+  width: 18px;
+  height: 18px;
+  margin: 0 auto;
+  border: 1.5px solid var(--dsw-alias-border-l2);
+  border-radius: 50%;
+  color: transparent;
+}
+
+.checkboxOn {
+  border-color: var(--dsw-alias-brand-primary);
+  background-color: var(--dsw-alias-brand-primary);
+  color: #fff;
+}
+@media not all and (min-width: 768px) {
+  .checkArea {
+    padding-block: 13px;
+  }
+}
