@@ -279,3 +279,31 @@
     background: var(--dsw-specific-sidebar-nav-item-hover);
   }
 }
+
+.bulkBar {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  width: 100%;
+  margin-block: auto;
+  padding: 6px 2px;
+}
+
+.bulkCount {
+  padding-left: 4px;
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--dsw-alias-label-tertiary);
+}
+
+.bulkActions {
+  display: flex;
+  gap: 6px;
+
+  > button {
+    flex: 1;
+    min-width: 0;
+    padding-right: 8px;
+    padding-left: 8px;
+  }
+}

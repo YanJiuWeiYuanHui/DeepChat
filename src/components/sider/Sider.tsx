@@ -1,5 +1,5 @@
 import clsx from 'clsx'
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslate } from '../../i18n/index.js'
 import {
   IconPanelLeftOutline16,
@@ -9,7 +9,13 @@ import {
 } from '../base/icons.js'
 import { setSiderCollapsed } from '../../services/settings.js'
 import { groupSessions } from '../../services/chat/sessionGroups.js'
-import { newChat, removeSession, useChatStore } from '../../services/chat/store.js'
+import {
+  newChat,
+  removeSession,
+  removeSessions,
+  toggleSessionsPin,
+  useChatStore,
+} from '../../services/chat/store.js'
 import type { SessionSummary } from '../../services/chat/types.js'
 import { Button } from '../base/Button.js'
 import { IconButton } from '../base/IconButton.js'
@@ -30,7 +36,86 @@ export const Sider = ({ mobile = false }: { mobile?: boolean }) => {
   const groups = useMemo(() => groupSessions(sessions, now, t), [sessions, now, t])
   const [deleting, setDeleting] = useState<SessionSummary | null>(null)
   const [deletePending, setDeletePending] = useState(false)
+  const [selectMode, setSelectMode] = useState(false)
+  const [selected, setSelected] = useState<ReadonlySet<string>>(() => new Set())
+  const [bulkDeleting, setBulkDeleting] = useState(false)
+  const [bulkPending, setBulkPending] = useState(false)
 
+  const exitSelect = () => {
+    setSelectMode(false)
+    setSelected(new Set())
+  }
+
+  /** 长按某条会话：进入批量选择并先选中它 */
+  const enterSelect = (id: string) => {
+    setSelectMode(true)
+    setSelected(new Set([id]))
+  }
+
+  const toggleSelect = (id: string) => {
+    setSelected((previous) => {
+      const next = new Set(previous)
+      if (next.has(id)) {
+        next.delete(id)
+      } else {
+        next.add(id)
+      }
+      return next
+    })
+  }
+
+  const toggleRef = useRef(toggleSelect)
+  toggleRef.current = toggleSelect
+
+
+  /** 多选模式下按住复选框划过：经过的每条反转一次，同一行不重复触发 */
+  useEffect(() => {
+    if (!selectMode) {
+      return
+    }
+    let active = false
+    const visited = new Set<string>()
+    const paint = (x: number, y: number) => {
+      const hit = document.elementFromPoint(x, y)
+      if (!hit || !hit.closest('[data-check]')) {
+        return
+      }
+      const row = hit.closest('[data-session-id]')
+      const id = row?.getAttribute('data-session-id')
+      if (!id || visited.has(id)) {
+        return
+      }
+      visited.add(id)
+      toggleRef.current(id)
+    }
+    const onDown = (event: PointerEvent) => {
+      const hit = document.elementFromPoint(event.clientX, event.clientY)
+      if (!hit || !hit.closest('[data-check]')) {
+        return
+      }
+      active = true
+      visited.clear()
+      paint(event.clientX, event.clientY)
+    }
+    const onMove = (event: PointerEvent) => {
+      if (active) {
+        paint(event.clientX, event.clientY)
+      }
+    }
+    const stop = () => {
+      active = false
+    }
+    window.addEventListener('pointerdown', onDown, true)
+    window.addEventListener('pointermove', onMove, true)
+    window.addEventListener('pointerup', stop, true)
+    window.addEventListener('pointercancel', stop, true)
+    return () => {
+      window.removeEventListener('pointerdown', onDown, true)
+      window.removeEventListener('pointermove', onMove, true)
+      window.removeEventListener('pointerup', stop, true)
+      window.removeEventListener('pointercancel', stop, true)
+    }
+  }, [selectMode])
   useEffect(() => {
     let timer: ReturnType<typeof setTimeout>
     const refresh = () => {
@@ -95,6 +180,10 @@ export const Sider = ({ mobile = false }: { mobile?: boolean }) => {
                   session={session}
                   active={session.id === activeId}
                   onDelete={() => setDeleting(session)}
+                  selectMode={selectMode}
+                  selected={selected.has(session.id)}
+                  onToggleSelect={() => toggleSelect(session.id)}
+                  onEnterSelect={() => enterSelect(session.id)}
                 />
               ))}
             </div>
@@ -102,12 +191,42 @@ export const Sider = ({ mobile = false }: { mobile?: boolean }) => {
         </div>
       </div>
       <div className={styles.bottom}>
-        <button type="button" className={styles.settings} onClick={() => openSettings('general')}>
-          <span className={styles.settingsIcon}>
-            <IconSettingsOutline16 />
-          </span>
-          <span className={styles.settingsLabel}>{t('settings')}</span>
-        </button>
+        {selectMode ? (
+          <div className={styles.bulkBar}>
+            <span className={styles.bulkCount}>{t('selectedCount', { count: selected.size })}</span>
+            <div className={styles.bulkActions}>
+              <Button
+                size="s"
+                variant="outlined"
+                disabled={selected.size === 0}
+                onClick={() => {
+                  toggleSessionsPin([...selected])
+                  exitSelect()
+                }}
+              >
+                {t('bulkPin')}
+              </Button>
+              <Button
+                size="s"
+                variant="dangerOutlined"
+                disabled={selected.size === 0}
+                onClick={() => setBulkDeleting(true)}
+              >
+                {t('delete')}
+              </Button>
+              <Button size="s" variant="outlined" onClick={exitSelect}>
+                {t('exitSelectMode')}
+              </Button>
+            </div>
+          </div>
+        ) : (
+          <button type="button" className={styles.settings} onClick={() => openSettings('general')}>
+            <span className={styles.settingsIcon}>
+              <IconSettingsOutline16 />
+            </span>
+            <span className={styles.settingsLabel}>{t('settings')}</span>
+          </button>
+        )}
       </div>
       {deleting ? (
         <Modal
@@ -144,6 +263,49 @@ export const Sider = ({ mobile = false }: { mobile?: boolean }) => {
           }
         >
           {t('deleteSessionWithFilesDescription')}
+        </Modal>
+      ) : null}
+      {bulkDeleting ? (
+        <Modal
+          title={t('bulkDeleteTitle', { count: selected.size })}
+          onClose={() => {
+            if (!bulkPending) {
+              setBulkDeleting(false)
+            }
+          }}
+          footer={
+            <>
+              <Button
+                variant="outlined"
+                disabled={bulkPending}
+                onClick={() => setBulkDeleting(false)}
+              >
+                {t('cancel')}
+              </Button>
+              <Button
+                variant="danger"
+                disabled={bulkPending}
+                onClick={async () => {
+                  const ids = [...selected]
+                  setBulkPending(true)
+                  try {
+                    const ok = await removeSessions(ids)
+                    setBulkDeleting(false)
+                    exitSelect()
+                    if (!ok) {
+                      showToast({ key: 'bulkDeleteFailed', type: 'error' })
+                    }
+                  } finally {
+                    setBulkPending(false)
+                  }
+                }}
+              >
+                {t('delete')}
+              </Button>
+            </>
+          }
+        >
+          {t('bulkDeleteDescription')}
         </Modal>
       ) : null}
     </div>
