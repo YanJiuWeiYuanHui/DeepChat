@@ -445,6 +445,7 @@ export const en = {
   avatarCropHint: 'Drag image to reposition and use slider to zoom',
   avatarCropZoom: 'Zoom',
   avatarCropConfirm: 'Use avatar',
+  avatarCropLoadFailed: 'Failed to load image, please choose another one',
   pinSession: 'Pin chat',
   unpinSession: 'Unpin chat',
   sessionHistoryPinnedLabel: 'Pinned',
@@ -463,4 +464,5 @@ export const en = {
   crossChatLinkedFilterPlaceholder: 'Filter chats by title…',
   crossChatLinkedClear: 'Clear',
   crossChatLinkedEmpty: 'No chats available',
+  loadEarlierMessages: 'Show earlier messages ({count} more)',
 } satisfies Record<keyof typeof zh, string>
