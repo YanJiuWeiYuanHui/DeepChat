@@ -1,5 +1,7 @@
 package com.deepchat.app;
 
+import android.webkit.WebView;
+import android.view.View;
 import android.Manifest;
 import android.app.Activity;
 import android.content.ActivityNotFoundException;
@@ -527,6 +529,8 @@ public class MainActivity extends BridgeActivity {
         startLocalProxy();
         super.onCreate(savedInstanceState);
         if (getBridge() != null && getBridge().getWebView() != null) {
+                WebView webView = getBridge().getWebView();
+    webView.setLayerType(View.LAYER_TYPE_SOFTWARE, null);
             getBridge().getWebView().addJavascriptInterface(new ProxyBridge(), "__DEEPCHAT_ANDROID_BRIDGE__");
             WebSettings settings = getBridge().getWebView().getSettings();
             settings.setMediaPlaybackRequiresUserGesture(false);
