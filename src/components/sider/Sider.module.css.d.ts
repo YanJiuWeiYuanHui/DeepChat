@@ -4,6 +4,7 @@ declare const styles: {
   readonly appName: string
   readonly newChat: string
   readonly newChatIcon: string
+  readonly searchTrigger: string
   readonly listWrap: string
   readonly list: string
   readonly section: string
@@ -12,6 +13,9 @@ declare const styles: {
   readonly settings: string
   readonly settingsIcon: string
   readonly settingsLabel: string
+  readonly bulkBar: string
+  readonly bulkCount: string
+  readonly bulkActions: string
   readonly collapsed: string
   readonly collapsedGroup: string
   readonly drawer: string
