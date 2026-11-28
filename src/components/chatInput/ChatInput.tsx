@@ -57,29 +57,22 @@ import { getAndroidProxyOrigin, getAndroidProxyToken } from '../../services/api/
 import { DraftAttachments } from './DraftAttachments.js'
 import { ImageSizePicker } from '../messages/ImageSizePicker.js'
 import { useVoiceInput } from './useVoiceInput.js'
+import { getVisibleMessages } from '../../services/chat/branches.js'
 import { Spectrum } from './Spectrum.js'
 import { useTranslate } from '../../i18n/index.js'
 import styles from './ChatInput.module.css'
 
 /**
- * 上下文窗口大小。模型名是从接口动态发现的，项目里没有窗口元数据，
- * 这里先按 1M 取值，后续应改为设置项或按模型名推断。
+ * 上下文窗口大小。模型名是从接口动态发现的，暂未携带窗口元数据，先按 1M 基准估算。
  */
 const CONTEXT_WINDOW = 1_000_000
-
-/** 达到该比例后环线转为警示色，提示即将触发截断 */
-const CONTEXT_DANGER_RATIO = 0.9
-
-/** 达到该比例后环线转为提醒色，提前预警 */
 const CONTEXT_WARN_RATIO = 0.7
-
-/** 环形进度：半径与周长（viewBox 32x32） */
+const CONTEXT_DANGER_RATIO = 0.9
 const RING_RADIUS = 13.5
 const RING_CIRCUMFERENCE = 2 * Math.PI * RING_RADIUS
 
-/** 压缩成 12.2K / 128K / 1M 这类紧凑写法 */
 const formatTokenCount = (value: number): string => {
-  if (value >= 1_000_000) {
+  if (value >= 999_950) {
     return `${Math.round(value / 100_000) / 10}M`
   }
   if (value >= 1000) {
@@ -88,9 +81,8 @@ const formatTokenCount = (value: number): string => {
   return String(Math.round(value))
 }
 
-/** 环内空间有限，只保留整数位：38K / 1.2M */
 const formatRingTokens = (value: number): string => {
-  if (value >= 1_000_000) {
+  if (value >= 999_500) {
     return `${Math.round(value / 100_000) / 10}M`
   }
   if (value >= 1000) {
@@ -98,7 +90,6 @@ const formatRingTokens = (value: number): string => {
   }
   return String(Math.round(value))
 }
-
 
 /** 输入框：自适应高度的文本框 + 文件 + 深度思考与智能搜索开关 + 语音输入 + 发送 / 停止 */
 export const ChatInput = memo(function ChatInput({ sessionId }: { sessionId: string | null }) {
@@ -119,12 +110,13 @@ const Input = ({ sessionId }: { sessionId: string | null }) => {
   const thinkingEffort = useSettings((state) => state.thinkingEffort)
   const chatProtocol = useSettings((state) => state.chatProtocol)
   const importingHistory = useChatStore((state) => state.importingHistory)
-  /** 最近一轮回复实际送入模型的输入 token，即当前上下文占用量 */
+  /** 当前分支最近一轮回复实际送入模型的输入 token，即当前上下文占用量 */
   const contextUsage = useChatStore((state) => {
-    const messages = sessionId ? state.sessionCache[sessionId]?.messages : undefined
-    if (!messages) {
+    const session = sessionId ? state.sessionCache[sessionId] : undefined
+    if (!session) {
       return null
     }
+    const messages = getVisibleMessages(session)
     for (let index = messages.length - 1; index >= 0; index -= 1) {
       const message = messages[index]
       if (message.role === 'assistant' && message.usage) {
@@ -133,31 +125,34 @@ const Input = ({ sessionId }: { sessionId: string | null }) => {
     }
     return null
   })
+  const isMobile = useIsMobile()
+  const search = useSettings((state) => state.search)
+  const imageGen = useSettings((state) => state.imageGen)
+  const imageGenChannel = useSettings((state) => state.imageGenChannel)
+  const imageGenReady = imageGenChannel.enabled && Boolean(imageGenChannel.model.trim())
+  const imageGenActive = imageGen && imageGenReady
   const contextTokens = contextUsage
     ? contextUsage.input_tokens +
       contextUsage.cache_creation_input_tokens +
       contextUsage.cache_read_input_tokens
     : 0
-  const contextRatio = Math.min(1, contextTokens / CONTEXT_WINDOW)
+  const rawContextRatio = contextTokens / CONTEXT_WINDOW
+  const contextRatio = Math.min(1, rawContextRatio)
   const contextLabel = contextTokens
     ? t('contextUsageSummary', {
-        percent: (contextRatio * 100).toFixed(contextRatio < 0.1 ? 1 : 0),
+        percent: (rawContextRatio * 100).toFixed(rawContextRatio < 0.1 ? 1 : 0),
         used: formatTokenCount(contextTokens),
         window: formatTokenCount(CONTEXT_WINDOW),
       })
     : ''
-  /** 环线颜色分级：常规 / 提醒（≥70%）/ 警示（≥90%） */
   const contextLevel =
     contextRatio >= CONTEXT_DANGER_RATIO
       ? styles.contextRingDanger
       : contextRatio >= CONTEXT_WARN_RATIO
         ? styles.contextRingWarn
         : null
-  const isMobile = useIsMobile()
-  const search = useSettings((state) => state.search)
-  const imageGen = useSettings((state) => state.imageGen)
-  const imageGenChannel = useSettings((state) => state.imageGenChannel)
-  const imageGenReady = imageGenChannel.enabled && Boolean(imageGenChannel.model.trim())
+  // 生图模式下不消耗对话上下文且左侧会展开尺寸选择器，自动隐藏占用环避免小屏按钮拥挤重叠
+  const showContextRing = Boolean(contextLabel) && !imageGenActive
   const hasImageAttachment = attachments.some((item) => item.isImage)
   const [plusOpen, setPlusOpen] = useState(false)
   const [effortMenuOpen, setEffortMenuOpen] = useState(false)
@@ -246,7 +241,7 @@ const Input = ({ sessionId }: { sessionId: string | null }) => {
     const observer = new ResizeObserver(updateLabels)
     observer.observe(toggles)
     return () => observer.disconnect()
-  }, [t, thinking, activeEffort, imageGen])
+  }, [t, thinking, activeEffort, imageGen, showContextRing])
 
   const acceptFiles = (files: File[]) => {
     if (files.length === 0 || useChatStore.getState().importingHistory) {
@@ -330,7 +325,10 @@ const Input = ({ sessionId }: { sessionId: string | null }) => {
     }
     const bridge = (
       window as {
-        __DEEPCHAT_ANDROID_BRIDGE__?: { capturePhoto?: () => boolean }
+        __DEEPCHAT_ANDROID_BRIDGE__?: {
+          capturePhoto?: () => boolean
+          consumePendingNativePhoto?: () => string
+        }
         __deepchatOnNativePhoto?: (photoId: string, fileName: string) => void
       }
     ).__DEEPCHAT_ANDROID_BRIDGE__
@@ -339,6 +337,7 @@ const Input = ({ sessionId }: { sessionId: string | null }) => {
       ;(
         window as { __deepchatOnNativePhoto?: (photoId: string, fileName: string) => void }
       ).__deepchatOnNativePhoto = (photoId: string, fileName: string) => {
+        bridge.consumePendingNativePhoto?.()
         const token = getAndroidProxyToken()
         void fetch(`${androidProxy}/__deepchat_captured_photo?id=${encodeURIComponent(photoId)}`, {
           headers: token ? { 'X-Proxy-Token': token } : {},
@@ -364,6 +363,44 @@ const Input = ({ sessionId }: { sessionId: string | null }) => {
     }
     cameraInputRef.current?.click()
   }
+
+  useEffect(() => {
+    const bridge = (
+      window as {
+        __DEEPCHAT_ANDROID_BRIDGE__?: { consumePendingNativePhoto?: () => string }
+      }
+    ).__DEEPCHAT_ANDROID_BRIDGE__
+    const androidProxy = getAndroidProxyOrigin()
+    const raw = bridge?.consumePendingNativePhoto?.()
+    if (!raw || !androidProxy) {
+      return
+    }
+    try {
+      const parsed = JSON.parse(raw) as { id?: string; name?: string }
+      if (!parsed.id) {
+        return
+      }
+      const token = getAndroidProxyToken()
+      void fetch(`${androidProxy}/__deepchat_captured_photo?id=${encodeURIComponent(parsed.id)}`, {
+        headers: token ? { 'X-Proxy-Token': token } : {},
+      })
+        .then(async (res) => {
+          if (!res.ok) {
+            throw new Error(`HTTP ${res.status}`)
+          }
+          const blob = await res.blob()
+          const file = new File([blob], parsed.name || `photo-${Date.now()}.jpg`, {
+            type: blob.type || 'image/jpeg',
+          })
+          acceptFilesRef.current([file])
+        })
+        .catch(() => {
+          showToast({ key: 'voiceCallCameraFailed' })
+        })
+    } catch {
+      // 忽略无效的原生照片状态
+    }
+  }, [])
   const retryFile = useCallback(
     (id: string) => {
       if (!useChatStore.getState().importingHistory && ensureApiKey()) {
@@ -824,14 +861,13 @@ const Input = ({ sessionId }: { sessionId: string | null }) => {
             ) : null}
           </div>
           <div className={styles.right}>
-            {contextLabel ? (
+            {showContextRing ? (
               <Tooltip content={contextLabel}>
                 <button
                   type="button"
                   className={clsx(styles.contextRing, contextLevel)}
                   aria-label={contextLabel}
                   onClick={() => {
-                    // 移动端没有悬停，点按后把完整数值以轻提示展示
                     if (isMobile) {
                       showToast(contextLabel)
                     }

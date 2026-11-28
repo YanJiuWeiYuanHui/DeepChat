@@ -89,3 +89,24 @@
     background-color: transparent;
   }
 }
+
+.shareSelectableRow {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  cursor: pointer;
+}
+
+.shareCheckCol {
+  flex-shrink: 0;
+  width: 24px;
+  padding-top: 14px;
+  display: flex;
+  justify-content: center;
+}
+
+.shareContentCol {
+  flex: 1;
+  min-width: 0;
+  pointer-events: none;
+}

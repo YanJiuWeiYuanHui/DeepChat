@@ -1,11 +1,17 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useTranslate } from '../../i18n/index.js'
 import { getApiOrigin } from '../../services/api/origin.js'
 import {
   DEFAULT_MODEL,
   DEFAULT_SYSTEM_PROMPT,
   DEFAULT_VOICE_SYSTEM_PROMPT,
+  applyModelPreset,
+  deleteModelPreset,
+  exportModelPresetsJson,
+  importModelPresetsJson,
+  renameModelPreset,
   resetModelAndPolicySettings,
+  saveModelPreset,
   setAllowEditAssistant,
   setAllowRefusedContext,
   setApiKey,
@@ -32,16 +38,19 @@ import {
   setTtsChannel,
   setVisionChannel,
   setVoiceSystemPrompt,
+  setWebSearchChannel,
   useSettings,
   type ChatProtocol,
 } from '../../services/settings.js'
 import { Button } from '../base/Button.js'
 import { Select, type SelectOption } from '../base/Select.js'
+import { saveDownloadedBlob } from '../../utils/download.js'
 import { ApiKeyConfirm, ApiKeyField, type useApiKeyEditor } from './ApiKeyField.js'
 import {
   CapabilityChannelCard,
   ImageGenChannelCard,
   ModelFetcherInput,
+  WebSearchChannelCard,
 } from './ChannelConfigField.js'
 import styles from './Settings.module.css'
 
@@ -270,6 +279,251 @@ const LOCAL_PRESETS = [
   { label: 'LocalAI (:8080)', url: 'http://127.0.0.1:8080/v1' },
 ] as const
 
+const CLOUD_COMPAT_PRESETS = [
+  { label: 'OpenCode Go', url: 'https://opencode.ai/zen/go/v1' },
+  { label: 'OpenCode Zen', url: 'https://opencode.ai/zen/v1' },
+] as const
+
+/** 多套模型接口预设管理与一键切换 */
+const ModelPresetsSection = ({ onApplied }: { onApplied?: () => void }) => {
+  const t = useTranslate()
+  const modelPresets = useSettings((state) => state.modelPresets)
+  const activeModelPresetId = useSettings((state) => state.activeModelPresetId)
+  const [creating, setCreating] = useState(false)
+  const [nameInput, setNameInput] = useState('')
+  const [includeChannels, setIncludeChannels] = useState(false)
+  const [renamingId, setRenamingId] = useState<string | null>(null)
+  const [renameDraft, setRenameDraft] = useState('')
+  const [status, setStatus] = useState<{ text: string; error?: boolean } | null>(null)
+  const importInputRef = useRef<HTMLInputElement>(null)
+
+  const activePreset = modelPresets.find((item) => item.id === activeModelPresetId)
+
+  const handleSaveNew = () => {
+    const trimmed = nameInput.trim()
+    if (!trimmed) {
+      setStatus({ text: t('modelPresetNameRequired'), error: true })
+      return
+    }
+    const saved = saveModelPreset(trimmed, { includeChannels })
+    setNameInput('')
+    setCreating(false)
+    setStatus({ text: t('modelPresetSavedToast', { name: saved.name }) })
+  }
+
+  const handleExport = async () => {
+    const json = exportModelPresetsJson()
+    const blob = new Blob([json], { type: 'application/json' })
+    const fileName = `deepchat-model-presets-${new Date().toISOString().slice(0, 10)}.json`
+    try {
+      await saveDownloadedBlob(blob, fileName)
+      setStatus({ text: t('modelPresetExported') })
+    } catch (error) {
+      setStatus({
+        text: error instanceof Error && error.message ? error.message : String(error),
+        error: true,
+      })
+    }
+  }
+
+  return (
+    <div className={styles.cell}>
+      <div className={styles.presetCard}>
+        <div className={styles.fieldHeader}>
+          <div className={styles.label}>{t('modelPresetsTitle')}</div>
+          <div className={styles.presetManageRow}>
+            <button
+              type="button"
+              className={styles.linkAction}
+              onClick={() => {
+                setCreating((prev) => !prev)
+                setRenamingId(null)
+                setStatus(null)
+              }}
+            >
+              {creating ? t('cancel') : t('modelPresetSaveAsNew')}
+            </button>
+            {modelPresets.length > 0 ? (
+              <button
+                type="button"
+                className={styles.linkAction}
+                onClick={() => void handleExport()}
+              >
+                {t('modelPresetExport')}
+              </button>
+            ) : null}
+            <button
+              type="button"
+              className={styles.linkAction}
+              onClick={() => importInputRef.current?.click()}
+            >
+              {t('modelPresetImport')}
+            </button>
+          </div>
+        </div>
+        <div className={styles.description}>{t('modelPresetsDesc')}</div>
+        <input
+          ref={importInputRef}
+          type="file"
+          accept=".json,application/json"
+          style={{ display: 'none' }}
+          onChange={async (event) => {
+            const file = event.target.files?.[0]
+            event.target.value = ''
+            if (!file) {
+              return
+            }
+            try {
+              const count = importModelPresetsJson(await file.text())
+              setStatus(
+                count > 0
+                  ? { text: t('modelPresetImported', { count }) }
+                  : { text: t('modelPresetImportEmpty'), error: true }
+              )
+            } catch {
+              setStatus({ text: t('modelPresetImportFailed'), error: true })
+            }
+          }}
+        />
+
+        {modelPresets.length > 0 ? (
+          <div className={styles.presetChipRow}>
+            {modelPresets.map((preset) => {
+              const isActive = preset.id === activeModelPresetId
+              return (
+                <div
+                  key={preset.id}
+                  className={`${styles.presetChipWrap} ${isActive ? styles.presetChipWrapActive : ''}`}
+                >
+                  <button
+                    type="button"
+                    className={styles.presetChipBtn}
+                    onClick={() => {
+                      if (applyModelPreset(preset.id)) {
+                        onApplied?.()
+                        setRenamingId(null)
+                        setStatus({ text: t('modelPresetSwitchedToast', { name: preset.name }) })
+                      }
+                    }}
+                  >
+                    {preset.name}
+                  </button>
+                </div>
+              )
+            })}
+          </div>
+        ) : (
+          <div className={styles.fetchHint}>{t('modelPresetsEmpty')}</div>
+        )}
+
+        {activePreset ? (
+          <div className={styles.presetManageRow}>
+            <Button
+              size="s"
+              variant="outlined"
+              onClick={() => {
+                saveModelPreset(activePreset.name, {
+                  includeChannels: activePreset.includeChannels,
+                  overwriteId: activePreset.id,
+                })
+                setStatus({ text: t('modelPresetUpdatedToast', { name: activePreset.name }) })
+              }}
+            >
+              {t('modelPresetUpdateActive')}
+            </Button>
+            <Button
+              size="s"
+              variant="outlined"
+              onClick={() => {
+                setRenamingId((prev) => (prev === activePreset.id ? null : activePreset.id))
+                setRenameDraft(activePreset.name)
+                setCreating(false)
+              }}
+            >
+              {t('sessionItemMenuRenameOption')}
+            </Button>
+            <Button
+              size="s"
+              variant="dangerOutlined"
+              onClick={() => {
+                deleteModelPreset(activePreset.id)
+                setRenamingId(null)
+                setStatus({ text: t('modelPresetDeletedToast', { name: activePreset.name }) })
+              }}
+            >
+              {t('delete')}
+            </Button>
+          </div>
+        ) : null}
+
+        {renamingId && activePreset?.id === renamingId ? (
+          <div className={styles.presetManageRow}>
+            <input
+              type="text"
+              className={styles.textInput}
+              style={{ flex: 1, minWidth: 140 }}
+              value={renameDraft}
+              placeholder={t('modelPresetNamePlaceholder')}
+              onChange={(event) => setRenameDraft(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter' && !event.nativeEvent.isComposing && renameDraft.trim()) {
+                  renameModelPreset(renamingId, renameDraft.trim())
+                  setRenamingId(null)
+                }
+              }}
+            />
+            <Button
+              size="s"
+              disabled={!renameDraft.trim()}
+              onClick={() => {
+                renameModelPreset(renamingId, renameDraft.trim())
+                setRenamingId(null)
+              }}
+            >
+              {t('confirm')}
+            </Button>
+          </div>
+        ) : null}
+
+        {creating ? (
+          <>
+            <div className={styles.presetManageRow}>
+              <input
+                type="text"
+                className={styles.textInput}
+                style={{ flex: 1, minWidth: 140 }}
+                value={nameInput}
+                placeholder={t('modelPresetNamePlaceholder')}
+                onChange={(event) => setNameInput(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter' && !event.nativeEvent.isComposing) {
+                    handleSaveNew()
+                  }
+                }}
+              />
+              <Button size="s" onClick={handleSaveNew}>
+                {t('save')}
+              </Button>
+            </div>
+            <label className={styles.presetCheckLabel}>
+              <input
+                type="checkbox"
+                checked={includeChannels}
+                onChange={(event) => setIncludeChannels(event.target.checked)}
+              />
+              <span>{t('modelPresetIncludeChannels')}</span>
+            </label>
+          </>
+        ) : null}
+
+        {status ? (
+          <div className={status.error ? styles.error : styles.fetchHint}>{status.text}</div>
+        ) : null}
+      </div>
+    </div>
+  )
+}
+
 /** 模型与接口设置：API 密钥、语言模型（动态获取）、多能力渠道、生图渠道及回复/拒答策略 */
 export const ModelSettings = ({
   apiKeyEditor,
@@ -295,6 +549,9 @@ export const ModelSettings = ({
 
   return (
     <>
+      <div className={styles.groupTitle}>{t('modelPresetsGroupTitle')}</div>
+      <ModelPresetsSection onApplied={apiKeyEditor.reset} />
+
       <div className={styles.groupTitle}>{t('modelSettingsSectionRequest')}</div>
 
       <ApiKeyField editor={apiKeyEditor} />
@@ -342,6 +599,7 @@ export const ModelSettings = ({
                   disabled={!snippetText.trim()}
                   onClick={() => {
                     if (applyConfigSnippet(snippetText)) {
+                      apiKeyEditor.reset()
                       setSnippetStatus({ text: t('importSnippetSuccess') })
                       setSnippetText('')
                     } else {
@@ -415,6 +673,25 @@ export const ModelSettings = ({
                 </button>
               ))}
             </div>
+          ) : settings.chatProtocol === 'openai' || settings.chatProtocol === 'responses' ? (
+            <div className={styles.presetRow}>
+              <span className={styles.fetchHint}>{t('compatPresetLabel')}</span>
+              {CLOUD_COMPAT_PRESETS.map((preset) => (
+                <button
+                  key={preset.url}
+                  type="button"
+                  className={styles.presetPill}
+                  onClick={() => {
+                    setApiOrigin(preset.url)
+                    if (settings.model === DEFAULT_MODEL) {
+                      setModel('')
+                    }
+                  }}
+                >
+                  {preset.label}
+                </button>
+              ))}
+            </div>
           ) : null}
         </div>
       </div>
@@ -439,6 +716,7 @@ export const ModelSettings = ({
             baseUrl={mainBaseUrl}
             apiKey={mainApiKey}
             customHeaders={settings.customHeaders}
+            filterNonChat
             placeholder={t('modelSettingsModelPlaceholder')}
             onChange={setModel}
           />
@@ -565,6 +843,10 @@ export const ModelSettings = ({
             modelPlaceholder="qwen-vl-ocr / gpt-4o"
             onChange={setOcrChannel}
           />
+          <WebSearchChannelCard
+            channel={settings.webSearchChannel}
+            onChange={setWebSearchChannel}
+          />
         </div>
       </div>
 
@@ -679,7 +961,14 @@ export const ModelSettings = ({
       </div>
 
       <div className={styles.resetRow}>
-        <Button variant="outlined" size="s" onClick={resetModelAndPolicySettings}>
+        <Button
+          variant="outlined"
+          size="s"
+          onClick={() => {
+            resetModelAndPolicySettings()
+            apiKeyEditor.reset()
+          }}
+        >
           {t('modelSettingsResetAll')}
         </Button>
       </div>

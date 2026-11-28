@@ -1,6 +1,6 @@
 import { useTranslate } from '../../i18n/index.js'
 import clsx from 'clsx'
-import { memo, useEffect, useState, type ReactNode } from 'react'
+import { memo, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react'
 import {
   IconBrowseOutline16,
   IconBrowseWarningOutline16,
@@ -68,12 +68,47 @@ export const ReplyArea = memo(function ReplyArea({
 }) {
   useTranslate()
   const collapseThinking = useSettings((state) => state.collapseThinking)
+  const autoCollapseThinking = useSettings((state) => state.autoCollapseThinking)
   const [open, setOpen] = useState(() => !collapseThinking)
   useEffect(() => {
     setOpen(!collapseThinking)
   }, [collapseThinking])
+  const prevMessageIdRef = useRef(message.id)
+  const prevHasResponseRef = useRef(hasResponse)
+  const prevStreamingRef = useRef(streaming)
+  useEffect(() => {
+    if (prevMessageIdRef.current !== message.id) {
+      prevMessageIdRef.current = message.id
+      prevHasResponseRef.current = hasResponse
+      prevStreamingRef.current = streaming
+      setOpen(!collapseThinking)
+      return
+    }
+    const prevHasResponse = prevHasResponseRef.current
+    const prevStreaming = prevStreamingRef.current
+    prevHasResponseRef.current = hasResponse
+    prevStreamingRef.current = streaming
+    if (autoCollapseThinking && !prevHasResponse && hasResponse && (streaming || prevStreaming)) {
+      setOpen(false)
+    }
+  }, [message.id, streaming, autoCollapseThinking, hasResponse, collapseThinking])
   const titleActive = streaming && !hasResponse
+  const boundedStreaming = autoCollapseThinking && titleActive
   useTicker(titleActive, 1000)
+  const stepsRef = useRef<HTMLDivElement>(null)
+  const stickyRef = useRef(true)
+  useEffect(() => {
+    if (boundedStreaming) {
+      stickyRef.current = true
+    }
+  }, [boundedStreaming])
+  useLayoutEffect(() => {
+    const el = stepsRef.current
+    if (!el || !boundedStreaming || !open || !stickyRef.current) {
+      return
+    }
+    el.scrollTop = el.scrollHeight
+  }, [boundedStreaming, open, view])
   if (view.steps.length === 0 && !(message.thinking && streaming)) {
     return null
   }
@@ -93,7 +128,18 @@ export const ReplyArea = memo(function ReplyArea({
         </div>
       ) : null}
       {open || !title ? (
-        <div className={styles.steps}>
+        <div
+          ref={stepsRef}
+          className={clsx(styles.steps, boundedStreaming && styles.stepsStreaming)}
+          onScroll={
+            boundedStreaming
+              ? (event) => {
+                  const el = event.currentTarget
+                  stickyRef.current = el.scrollHeight - el.scrollTop - el.clientHeight <= 24
+                }
+              : undefined
+          }
+        >
           {view.steps.map((step, index) => (
             <StepItem
               key={stepKey(step, index)}

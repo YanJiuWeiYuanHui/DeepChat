@@ -12,6 +12,8 @@ import { stopReadAloud } from '../../services/speech/readAloud.js'
 import { IconButton } from '../base/IconButton.js'
 import { showToast } from '../base/toastState.js'
 import { openMobileSider } from '../sider/mobileSiderState.js'
+import type { Session } from '../../services/chat/types.js'
+import { SessionPromptButton } from './SessionPromptButton.js'
 import styles from './MobileHeader.module.css'
 
 /** 右上角语音自动播报小喇叭开关按钮（桌面与移动端共用） */
@@ -39,8 +41,8 @@ export const AutoPlayVoiceButton = ({ size = 'xl' }: { size?: 'm' | 'xl' }) => {
   )
 }
 
-/** 移动端顶栏：左侧菜单打开侧边栏；右侧小喇叭控制语音自动播报与新增对话 */
-export const MobileHeader = ({ title }: { title?: string }) => {
+/** 移动端顶栏：左侧菜单打开侧边栏；右侧会话提示词、语音自动播报与新增对话 */
+export const MobileHeader = ({ title, session }: { title?: string; session?: Session }) => {
   const t = useTranslate()
   return (
     <div className={styles.header}>
@@ -53,6 +55,7 @@ export const MobileHeader = ({ title }: { title?: string }) => {
       />
       <div className={styles.title}>{title ?? ''}</div>
       <div className={styles.actions}>
+        {session ? <SessionPromptButton session={session} size="xl" /> : null}
         <AutoPlayVoiceButton size="xl" />
         <IconButton
           size="xl"

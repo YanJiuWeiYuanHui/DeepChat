@@ -802,3 +802,29 @@ export const IconChatBubbleOutline16 = () => (
     />
   </svg>
 )
+
+export const IconShareOutline16 = () => (
+  <svg width={16} height={16} viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+    <path
+      d="M9.5 3.25L13.75 7.25L9.5 11.25V8.75C6.2 8.75 3.9 9.75 2.25 12.25C2.85 8.5 5.2 5.75 9.5 5.75V3.25Z"
+      stroke="currentColor"
+      strokeWidth="1.35"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    />
+  </svg>
+)
+
+export const IconSystemPromptOutline20 = () => (
+  <svg width={20} height={20} viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">
+    <path
+      d="M4.25 5.5H15.75M4.25 10H15.75M4.25 14.5H15.75"
+      stroke="currentColor"
+      strokeWidth="1.5"
+      strokeLinecap="round"
+    />
+    <circle cx="7.5" cy="5.5" r="1.75" fill="var(--dsw-alias-bg-layer-1, #fff)" stroke="currentColor" strokeWidth="1.5" />
+    <circle cx="13" cy="10" r="1.75" fill="var(--dsw-alias-bg-layer-1, #fff)" stroke="currentColor" strokeWidth="1.5" />
+    <circle cx="8.5" cy="14.5" r="1.75" fill="var(--dsw-alias-bg-layer-1, #fff)" stroke="currentColor" strokeWidth="1.5" />
+  </svg>
+)

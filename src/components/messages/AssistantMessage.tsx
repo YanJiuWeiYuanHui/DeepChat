@@ -6,6 +6,7 @@ import {
   IconBranchOutline16,
   IconEditOutline16,
   IconRefreshOutline16,
+  IconShareOutline16,
   IconTrashOutline16,
   IconWarningOutline16,
 } from '../base/icons.js'
@@ -33,6 +34,7 @@ import { CopyButton } from './CopyButton.js'
 import { DeleteBranchModal } from './DeleteBranchModal.js'
 import { GeneratedImage } from './GeneratedImage.js'
 import { ReplyArea } from './ReplyArea.js'
+import { enterShareSelect } from './shareSelectState.js'
 import { useReplyView } from './useReplyView.js'
 import {
   BranchSwitcher,
@@ -312,6 +314,16 @@ export const AssistantMessage = memo(function AssistantMessage({
                       if (forkSessionFromMessage(sessionId, message.id)) {
                         showToast({ key: 'branchChatToast' })
                       }
+                    }}
+                  />
+                  <IconButton
+                    icon={<IconShareOutline16 />}
+                    tooltip={t('shareChat')}
+                    tooltipPlacement="bottom"
+                    disabled={busy}
+                    onClick={() => {
+                      stopReadAloud()
+                      enterShareSelect(sessionId, message.id)
                     }}
                   />
                   <IconButton

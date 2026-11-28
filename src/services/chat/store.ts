@@ -43,6 +43,21 @@ import {
 } from './drafts.js'
 import { createLatestReminder } from './latestReminder.js'
 import { buildCrossChatMemory } from './memory.js'
+import {
+  clearNativeBackup,
+  exportRawIndexedDBSnapshot,
+  flushNativeSessionBackups,
+  getNativeStorageXray,
+  isNativeBackupAvailable,
+  listNativeBackup,
+  refreshNativeSessionBackups,
+  removeNativeSessionBackup,
+  restoreMissingFromNativeBackup,
+  scheduleNativeSessionBackup,
+  syncMissingToNativeBackup,
+  type NativeStorageXray,
+  type RawIdbExportResult,
+} from './nativeBackup.js'
 import { extractMemoriesFromTurn, formatSavedMemories } from './savedMemory.js'
 import {
   applyEvent,
@@ -213,14 +228,27 @@ const updateSession = (id: string, update: (session: Session) => Session) =>
   })
 
 const updateReply = (sessionId: string, reply: AssistantMessage) =>
-  updateSession(sessionId, (session) => ({
-    ...session,
-    messages: session.messages.map((message) =>
-      message.id === reply.id
-        ? { ...reply, parentId: message.parentId, selectedChildId: message.selectedChildId }
-        : message
-    ),
-  }))
+  updateSession(sessionId, (session) => {
+    const lastIdx = session.messages.length - 1
+    if (lastIdx >= 0 && session.messages[lastIdx].id === reply.id) {
+      const target = session.messages[lastIdx]
+      const messages = session.messages.slice()
+      messages[lastIdx] = {
+        ...reply,
+        parentId: target.parentId,
+        selectedChildId: target.selectedChildId,
+      }
+      return { ...session, messages }
+    }
+    return {
+      ...session,
+      messages: session.messages.map((message) =>
+        message.id === reply.id
+          ? { ...reply, parentId: message.parentId, selectedChildId: message.selectedChildId }
+          : message
+      ),
+    }
+  })
 
 const persist = (sessionId: string) => {
   const session = getSession(sessionId)
@@ -248,6 +276,9 @@ const persist = (sessionId: string) => {
             ),
           }))
           trimSessionCache()
+          if (!deletingSessions.has(sessionId)) {
+            scheduleNativeSessionBackup(session)
+          }
         }
       })
       .catch((error: unknown) => {
@@ -282,6 +313,7 @@ export const bindChatPersistence = () => {
         persist(id)
       }
     }
+    flushNativeSessionBackups()
   }
   const onVisibilityChange = () => {
     if (document.visibilityState === 'hidden') {
@@ -361,9 +393,20 @@ export const initChat = (): Promise<void> => {
   set({ initError: false })
   initTask = (async () => {
     try {
+      void db.requestPersistentStorage()
+      await db
+        .repairMissingSessionSummaries()
+        .catch(db.reportStorageError('repair missing summaries'))
+      await restoreMissingFromNativeBackup({
+        shouldSkip: (id) => deletingSessions.has(id),
+        shouldAbort: () => epoch !== historyEpoch || get().importingHistory,
+      }).catch(db.reportStorageError('restore from native backup'))
       const summaries = await db.loadSessionSummaries()
       if (epoch === historyEpoch) {
         set({ ready: true, sessions: sortSessions(summaries) })
+        void syncMissingToNativeBackup(
+          (id) => get().importingHistory || deletingSessions.has(id)
+        )
       }
     } catch (error) {
       if (epoch === historyEpoch) {
@@ -378,6 +421,69 @@ export const initChat = (): Promise<void> => {
   })()
   return initTask
 }
+
+export type StorageHealthReport = db.IndexedDBDiagnostics & {
+  repairedCount: number
+  restoredFromNativeCount: number
+  nativeBackupAvailable: boolean
+  nativeBackupCount: number
+  nativeBackupBytes: number
+  nativeXray: NativeStorageXray | null
+}
+
+/** 诊断并尝试自愈本地存储：申请持久化配额、从主表补全缺失摘要、从 Android 原生目录恢复缺失会话。 */
+export const inspectAndRepairStorage = async (): Promise<StorageHealthReport> => {
+  const persisted = await db.requestPersistentStorage()
+  const epoch = historyEpoch
+  let repaired = 0
+  let nativeRestore = {
+    restored: 0,
+    nativeCount: 0,
+    totalBytes: 0,
+  }
+  if (!get().importingHistory) {
+    const repairResult = await db
+      .repairMissingSessionSummaries()
+      .catch(() => ({ repaired: 0, totalSessions: 0 }))
+    repaired = repairResult.repaired
+    if (!get().importingHistory && epoch === historyEpoch) {
+      nativeRestore = await restoreMissingFromNativeBackup({
+        shouldSkip: (id) => deletingSessions.has(id),
+        shouldAbort: () => epoch !== historyEpoch || get().importingHistory,
+      }).catch(() => ({
+        restored: 0,
+        nativeCount: 0,
+        totalBytes: 0,
+      }))
+    }
+    if ((repaired > 0 || nativeRestore.restored > 0) && !get().importingHistory && epoch === historyEpoch) {
+      const summaries = await db.loadSessionSummaries()
+      if (!get().importingHistory && epoch === historyEpoch) {
+        set({ ready: true, initError: false, sessions: sortSessions(summaries) })
+      }
+    }
+    if (get().ready && !get().importingHistory && epoch === historyEpoch) {
+      void syncMissingToNativeBackup((id) => get().importingHistory || deletingSessions.has(id))
+    }
+  }
+  const [diagnostics, nativeList, nativeXray] = await Promise.all([
+    db.getIndexedDBDiagnostics(),
+    listNativeBackup(),
+    getNativeStorageXray(),
+  ])
+  return {
+    ...diagnostics,
+    persisted: diagnostics.persisted ?? persisted,
+    repairedCount: repaired,
+    restoredFromNativeCount: nativeRestore.restored,
+    nativeBackupAvailable: isNativeBackupAvailable(),
+    nativeBackupCount: nativeList?.sessions.length ?? nativeRestore.nativeCount,
+    nativeBackupBytes: nativeList?.totalBytes ?? nativeRestore.totalBytes,
+    nativeXray,
+  }
+}
+
+export const exportRawIndexedDB = (): Promise<RawIdbExportResult> => exportRawIndexedDBSnapshot()
 
 /** 同一会话合并并发读取；切换只改变 activeId，旧请求不会把界面切回去。 */
 const ensureSessionLoaded = (id: string): Promise<void> => {
@@ -447,11 +553,15 @@ const waitForIdle = (sessionId?: string) =>
     })
   })
 
-/**
- * 替换历史对话：先写入暂存，成功后原子替换旧记录；写入为空即删除全部会话与附件。
- * 期间停止生成并禁止修改会话；失败时清除暂存，保留原有记录。
- */
-export const replaceHistory = async (write: () => Promise<void>): Promise<number> => {
+export type MergeHistoryResult = {
+  total: number
+  added: number
+  updated: number
+  kept: number
+  filesAdded: number
+}
+
+const runExclusiveHistoryOp = async <T>(work: () => Promise<T>): Promise<T> => {
   if (get().importingHistory) {
     throw new Error('History replacement is already in progress')
   }
@@ -460,12 +570,31 @@ export const replaceHistory = async (write: () => Promise<void>): Promise<number
     for (const controller of Object.values(get().streaming)) {
       controller.abort()
     }
-    // 已开始的单条删除先同步到内存，避免本次替换失败后列表残留已被删除的记录。
+    // 已开始的单条删除先同步到内存，避免操作结束后列表残留已被删除的记录。
     await Promise.all(deletionTasks)
     historyEpoch += 1
     initTask = undefined
     sessionLoads.clear()
     await waitForIdle()
+    return await work()
+  } finally {
+    set({ importingHistory: false })
+    retrySaveSessions()
+    const { activeId, ready } = get()
+    if (activeId !== null) {
+      void ensureSessionLoaded(activeId)
+    } else if (!ready) {
+      void initChat()
+    }
+  }
+}
+
+/**
+ * 替换历史对话：先写入暂存，成功后原子替换旧记录；写入为空即删除全部会话与附件。
+ * 期间停止生成并禁止修改会话；失败时清除暂存，保留原有记录。
+ */
+export const replaceHistory = async (write: () => Promise<void>): Promise<number> => {
+  const count = await runExclusiveHistoryOp(async () => {
     await db.clearStaging()
     let summaries: SessionSummary[]
     try {
@@ -479,6 +608,7 @@ export const replaceHistory = async (write: () => Promise<void>): Promise<number
     unsavedSessions.clear()
     pendingFiles.clear()
     clearAllDrafts()
+    await clearNativeBackup().catch(db.reportStorageError('clear native backup'))
     set({
       ready: true,
       initError: false,
@@ -489,23 +619,115 @@ export const replaceHistory = async (write: () => Promise<void>): Promise<number
       activeId: null,
     })
     return summaries.length
-  } finally {
-    set({ importingHistory: false })
-    retrySaveSessions()
-    const { activeId, ready } = get()
-    // 替换失败时恢复被取消的详情读取，原有记录继续可用。
-    if (activeId !== null) {
-      void ensureSessionLoaded(activeId)
-    } else if (!ready) {
-      void initChat()
-    }
+  })
+  void syncMissingToNativeBackup((id) => get().importingHistory || deletingSessions.has(id))
+  return count
+}
+
+const applyMergedStaging = async (): Promise<{
+  result: MergeHistoryResult
+  updatedIds: string[]
+}> => {
+  const result = await db.mergeStaging()
+  const updatedSet = new Set(result.updatedIds)
+  for (const id of updatedSet) {
+    sessionAccess.delete(id)
+    unsavedSessions.delete(id)
+    pendingFiles.delete(id)
   }
+  set((state) => ({
+    ready: true,
+    initError: false,
+    sessions: sortSessions(result.summaries),
+    sessionCache:
+      updatedSet.size > 0
+        ? Object.fromEntries(
+            Object.entries(state.sessionCache).filter(([id]) => !updatedSet.has(id))
+          )
+        : state.sessionCache,
+    sessionLoadErrors:
+      updatedSet.size > 0
+        ? Object.fromEntries(
+            Object.entries(state.sessionLoadErrors).filter(([id]) => !updatedSet.has(id))
+          )
+        : state.sessionLoadErrors,
+    sessionSaveErrors:
+      updatedSet.size > 0
+        ? Object.fromEntries(
+            Object.entries(state.sessionSaveErrors).filter(([id]) => !updatedSet.has(id))
+          )
+        : state.sessionSaveErrors,
+  }))
+  return {
+    result: {
+      total: result.summaries.length,
+      added: result.added,
+      updated: result.updated,
+      kept: result.kept,
+      filesAdded: result.filesAdded,
+    },
+    updatedIds: result.updatedIds,
+  }
+}
+
+const syncMergedNativeBackups = (updatedIds: readonly string[]) => {
+  const shouldSkip = (id: string) => get().importingHistory || deletingSessions.has(id)
+  void syncMissingToNativeBackup(shouldSkip)
+  if (updatedIds.length > 0) {
+    void refreshNativeSessionBackups(updatedIds, shouldSkip)
+  }
+}
+
+/**
+ * 追加合并历史对话：绝不删除本地已有对话和旧存档；先写入暂存校验，
+ * 再分小批增量合入正式库（同 ID 对话保留消息更全或更晚的版本）。
+ */
+export const mergeHistory = async (write: () => Promise<void>): Promise<MergeHistoryResult> => {
+  const { result, updatedIds } = await runExclusiveHistoryOp(async () => {
+    await db.clearStaging()
+    try {
+      await write()
+    } catch (error) {
+      await db.clearStaging().catch(db.reportStorageError('clear failed history merge'))
+      throw error
+    }
+    return applyMergedStaging()
+  })
+  syncMergedNativeBackups(updatedIds)
+  return result
+}
+
+/** 把意外滞留在 IndexedDB 暂存表中的对话安全追加合并到正式列表（不删除既有对话）。 */
+export const mergePendingStaging = async (): Promise<MergeHistoryResult> => {
+  const { result, updatedIds } = await runExclusiveHistoryOp(applyMergedStaging)
+  syncMergedNativeBackups(updatedIds)
+  return result
 }
 
 export const newChat = () => {
   if (!get().importingHistory) {
     set({ activeId: null })
     trimSessionCache()
+  }
+}
+
+export const setSessionSystemPrompt = (id: string, systemPrompt: string) => {
+  if (get().importingHistory || deletingSessions.has(id)) {
+    return
+  }
+  const trimmed = systemPrompt.trim()
+  const nextPrompt = trimmed ? systemPrompt : undefined
+  if (getSession(id)) {
+    updateSession(id, (session) => {
+      const next = { ...session }
+      if (nextPrompt !== undefined) {
+        next.systemPrompt = nextPrompt
+      } else {
+        delete next.systemPrompt
+      }
+      return next
+    })
+    persist(id)
   }
 }
 
@@ -549,32 +771,75 @@ export const renameSession = (id: string, title: string) => {
         session.id === id ? { ...session, title } : session
       ),
     }))
-    void db.renameSession(id, title).catch(db.reportStorageError('rename session'))
+    const epoch = historyEpoch
+    void db
+      .renameSession(id, title)
+      .then(() => db.loadSession(id))
+      .then((session) => {
+        if (session && epoch === historyEpoch && !get().importingHistory && !deletingSessions.has(id)) {
+          scheduleNativeSessionBackup(session)
+        }
+      })
+      .catch(db.reportStorageError('rename session'))
   }
 }
 
-export const togglePinSession = (id: string) => {
+const applySessionPin = (id: string, pinnedAt: number | undefined) => {
   if (get().importingHistory || deletingSessions.has(id)) {
     return
   }
   const currentSummary = get().sessions.find((session) => session.id === id)
-  if (!currentSummary) {
+  if (!currentSummary || currentSummary.pinnedAt === pinnedAt) {
     return
   }
-  const nextPinnedAt = currentSummary.pinnedAt ? undefined : Date.now()
   if (getSession(id)) {
-    updateSession(id, (session) => ({ ...session, pinnedAt: nextPinnedAt }))
+    updateSession(id, (session) => ({ ...session, pinnedAt }))
     persist(id)
   } else {
     set((state) => ({
       sessions: sortSessions(
-        state.sessions.map((session) =>
-          session.id === id ? { ...session, pinnedAt: nextPinnedAt } : session
-        )
+        state.sessions.map((session) => (session.id === id ? { ...session, pinnedAt } : session))
       ),
     }))
-    void db.setSessionPinned(id, nextPinnedAt).catch(db.reportStorageError('pin session'))
+    const epoch = historyEpoch
+    void db
+      .setSessionPinned(id, pinnedAt)
+      .then(() => db.loadSession(id))
+      .then((session) => {
+        if (session && epoch === historyEpoch && !get().importingHistory && !deletingSessions.has(id)) {
+          scheduleNativeSessionBackup(session)
+        }
+      })
+      .catch(db.reportStorageError('pin session'))
   }
+}
+
+export const togglePinSession = (id: string) => {
+  const currentSummary = get().sessions.find((session) => session.id === id)
+  if (!currentSummary) {
+    return
+  }
+  applySessionPin(id, currentSummary.pinnedAt ? undefined : Date.now())
+}
+
+export const setSessionsPinned = (ids: readonly string[], pinned: boolean) => {
+  if (get().importingHistory || ids.length === 0) {
+    return
+  }
+  const baseTime = Date.now()
+  ids.forEach((id, index) => {
+    applySessionPin(id, pinned ? baseTime - index : undefined)
+  })
+}
+
+export const toggleSessionsPin = (ids: readonly string[]) => {
+  if (get().importingHistory || ids.length === 0) {
+    return
+  }
+  const targetSet = new Set(ids)
+  const selected = get().sessions.filter((session) => targetSet.has(session.id))
+  const allPinned = selected.length > 0 && selected.every((session) => Boolean(session.pinnedAt))
+  setSessionsPinned(ids, !allPinned)
 }
 
 /**
@@ -585,6 +850,29 @@ export const removeSession = (id: string): Promise<boolean> => {
   const task = removeSessionData(id).finally(() => deletionTasks.delete(task))
   deletionTasks.add(task)
   return task
+}
+
+export const removeSessions = async (
+  ids: readonly string[]
+): Promise<{ removed: string[]; failed: string[] }> => {
+  const uniqueIds = [...new Set(ids)]
+  const removed: string[] = []
+  const failed: string[] = []
+  let cursor = 0
+  const workerCount = Math.min(6, uniqueIds.length)
+  await Promise.all(
+    Array.from({ length: workerCount }, async () => {
+      while (cursor < uniqueIds.length) {
+        const id = uniqueIds[cursor++]
+        if (await removeSession(id)) {
+          removed.push(id)
+        } else {
+          failed.push(id)
+        }
+      }
+    })
+  )
+  return { removed, failed }
 }
 
 const removeSessionData = async (id: string): Promise<boolean> => {
@@ -601,6 +889,7 @@ const removeSessionData = async (id: string): Promise<boolean> => {
       return false
     }
     await db.deleteSession(id)
+    await removeNativeSessionBackup(id).catch(db.reportStorageError('delete native backup'))
     if (epoch !== historyEpoch) {
       return true
     }
@@ -1264,6 +1553,27 @@ const TEXT_MIME_RE =
 const TEXT_EXT_RE =
   /\.(txt|md|markdown|json|csv|tsv|yaml|yml|xml|html|htm|css|js|jsx|ts|tsx|py|go|rs|java|c|cpp|h|hpp|sh|sql|log|ini|toml|env)$/i
 
+const MAX_INLINE_IMAGE_CACHE = 24
+const inlineImageDataUrlCache = new Map<string, string>()
+
+const getCachedBlobDataUrl = async (fileId: string, blob: Blob): Promise<string> => {
+  const cached = inlineImageDataUrlCache.get(fileId)
+  if (cached !== undefined) {
+    inlineImageDataUrlCache.delete(fileId)
+    inlineImageDataUrlCache.set(fileId, cached)
+    return cached
+  }
+  const dataUrl = await blobToDataUrl(blob)
+  inlineImageDataUrlCache.set(fileId, dataUrl)
+  if (inlineImageDataUrlCache.size > MAX_INLINE_IMAGE_CACHE) {
+    const oldestKey = inlineImageDataUrlCache.keys().next().value
+    if (oldestKey !== undefined) {
+      inlineImageDataUrlCache.delete(oldestKey)
+    }
+  }
+  return dataUrl
+}
+
 const findLocalBlob = async (sessionId: string, fileId: string): Promise<Blob | undefined> => {
   const pending = pendingFiles.get(sessionId)?.find((item) => item.id === fileId)?.blob
   return pending ?? (await db.loadFile(fileId))
@@ -1289,71 +1599,88 @@ const prepareInlineAttachments = async (
   const extraNotes: string[] = []
   const strippedFileIds = new Set<string>()
 
-  const allFiles: FileAttachment[] = [...request.question.files]
+  const allFiles: { file: FileAttachment; isCurrent: boolean }[] = request.question.files.map(
+    (file) => ({ file, isCurrent: true })
+  )
   for (const [user] of getContextRounds(request.history, settings.allowRefusedContext)) {
-    allFiles.push(...user.files)
+    for (const file of user.files) {
+      allFiles.push({ file, isCurrent: false })
+    }
   }
+  const processedHistoryKeys = new Set<string>()
 
-  for (const file of allFiles) {
+  for (const { file, isCurrent: isCurrentQuestionFile } of allFiles) {
     signal.throwIfAborted()
     const key = file.serverId ?? file.id
-    const isCurrentQuestionFile = request.question.files.some((f) => f.id === file.id)
-    const blob = await findLocalBlob(sessionId, file.id)
-    if (!blob) {
-      continue
+    if (!isCurrentQuestionFile) {
+      if (processedHistoryKeys.has(key) || inlineImages.has(key) || inlineTexts.has(key)) {
+        continue
+      }
+      processedHistoryKeys.add(key)
     }
+    try {
+      const blob = await findLocalBlob(sessionId, file.id)
+      if (!blob) {
+        continue
+      }
 
-    if (file.isImage) {
-      const dataUrl = await blobToDataUrl(blob)
-      if (settings.visionChannel.mode === 'custom' && isCurrentQuestionFile) {
-        const visionKey = settings.visionChannel.apiKey.trim() || settings.apiKey || ''
-        const visionOrigin = settings.visionChannel.baseUrl.trim() || getApiOrigin()
-        const visionModel = settings.visionChannel.model.trim() || settings.model
-        const desc = await recognizeWithOpenAIVision({
-          baseUrl: visionOrigin,
-          apiKey: visionKey,
-          model: visionModel,
-          prompt: `请详细识别并描述这张图片（${file.name}）中的关键内容、文字与细节，供后续对话回答使用。`,
-          dataUrl,
-          signal,
-        })
-        if (desc) {
-          extraNotes.push(`[图片识别（${file.name}）：${desc}]`)
+      if (file.isImage) {
+        const dataUrl = await getCachedBlobDataUrl(file.id, blob)
+        if (settings.visionChannel.mode === 'custom' && isCurrentQuestionFile) {
+          const visionKey = settings.visionChannel.apiKey.trim() || settings.apiKey || ''
+          const visionOrigin = settings.visionChannel.baseUrl.trim() || getApiOrigin()
+          const visionModel = settings.visionChannel.model.trim() || settings.model
+          const desc = await recognizeWithOpenAIVision({
+            baseUrl: visionOrigin,
+            apiKey: visionKey,
+            model: visionModel,
+            prompt: `请详细识别并描述这张图片（${file.name}）中的关键内容、文字与细节，供后续对话回答使用。`,
+            dataUrl,
+            signal,
+          })
+          if (desc) {
+            extraNotes.push(`[图片识别（${file.name}）：${desc}]`)
+          }
+          strippedFileIds.add(file.id)
+        } else if (settings.chatProtocol !== 'deepseek') {
+          inlineImages.set(key, dataUrl)
+        }
+        continue
+      }
+
+      // 非图片文件（文档 / 文字识别）
+      const isTextReadable = TEXT_MIME_RE.test(file.mimeType) || TEXT_EXT_RE.test(file.name)
+      if (settings.ocrChannel.mode === 'custom' && isCurrentQuestionFile) {
+        if (isTextReadable && blob.size <= 512 * 1024) {
+          const content = await blob.text()
+          extraNotes.push(`[文件文本（${file.name}）：\n${content.slice(0, 12000)}]`)
+        } else {
+          const ocrKey = settings.ocrChannel.apiKey.trim() || settings.apiKey || ''
+          const ocrOrigin = settings.ocrChannel.baseUrl.trim() || getApiOrigin()
+          const ocrModel = settings.ocrChannel.model.trim() || settings.model
+          const dataUrl = await blobToDataUrl(blob)
+          const text = await recognizeWithOpenAIVision({
+            baseUrl: ocrOrigin,
+            apiKey: ocrKey,
+            model: ocrModel,
+            prompt: `请完整提取并识别文件「${file.name}」中的所有文字内容。`,
+            dataUrl,
+            signal,
+          })
+          if (text) {
+            extraNotes.push(`[文字识别（${file.name}）：${text}]`)
+          }
         }
         strippedFileIds.add(file.id)
-      } else if (settings.chatProtocol !== 'deepseek') {
-        inlineImages.set(key, dataUrl)
-      }
-      continue
-    }
-
-    // 非图片文件（文档 / 文字识别）
-    const isTextReadable = TEXT_MIME_RE.test(file.mimeType) || TEXT_EXT_RE.test(file.name)
-    if (settings.ocrChannel.mode === 'custom' && isCurrentQuestionFile) {
-      if (isTextReadable && blob.size <= 512 * 1024) {
+      } else if (settings.chatProtocol !== 'deepseek' && isTextReadable && blob.size <= 512 * 1024) {
         const content = await blob.text()
-        extraNotes.push(`[文件文本（${file.name}）：\n${content.slice(0, 12000)}]`)
-      } else {
-        const ocrKey = settings.ocrChannel.apiKey.trim() || settings.apiKey || ''
-        const ocrOrigin = settings.ocrChannel.baseUrl.trim() || getApiOrigin()
-        const ocrModel = settings.ocrChannel.model.trim() || settings.model
-        const dataUrl = await blobToDataUrl(blob)
-        const text = await recognizeWithOpenAIVision({
-          baseUrl: ocrOrigin,
-          apiKey: ocrKey,
-          model: ocrModel,
-          prompt: `请完整提取并识别文件「${file.name}」中的所有文字内容。`,
-          dataUrl,
-          signal,
-        })
-        if (text) {
-          extraNotes.push(`[文字识别（${file.name}）：${text}]`)
-        }
+        inlineTexts.set(key, `[文件：${file.name}]\n${content.slice(0, 12000)}`)
       }
-      strippedFileIds.add(file.id)
-    } else if (settings.chatProtocol !== 'deepseek' && isTextReadable && blob.size <= 512 * 1024) {
-      const content = await blob.text()
-      inlineTexts.set(key, `[文件：${file.name}]\n${content.slice(0, 12000)}`)
+    } catch (error) {
+      signal.throwIfAborted()
+      if (isCurrentQuestionFile) {
+        throw error
+      }
     }
   }
 
@@ -1774,10 +2101,34 @@ const streamReply = async (sessionId: string, initial: AssistantMessage, request
   let reply = initial
   let turnUsage: MessageUsage | undefined
   let frame = 0
+  let flushTimer: ReturnType<typeof setTimeout> | undefined
+  let lastFlushAt = 0
+  const STREAM_FLUSH_INTERVAL_MS = 100
   const flush = () => {
+    clearTimeout(flushTimer)
+    flushTimer = undefined
     cancelAnimationFrame(frame)
     frame = 0
+    lastFlushAt = Date.now()
     updateReply(sessionId, reply)
+  }
+  const scheduleFlush = () => {
+    if (document.visibilityState === 'hidden') {
+      flush()
+      return
+    }
+    if (frame || flushTimer) {
+      return
+    }
+    const elapsed = Date.now() - lastFlushAt
+    if (elapsed >= STREAM_FLUSH_INTERVAL_MS) {
+      frame = requestAnimationFrame(flush)
+    } else {
+      flushTimer = setTimeout(() => {
+        flushTimer = undefined
+        frame ||= requestAnimationFrame(flush)
+      }, STREAM_FLUSH_INTERVAL_MS - elapsed)
+    }
   }
   streamFlushes.set(sessionId, flush)
 
@@ -1822,10 +2173,12 @@ const streamReply = async (sessionId: string, initial: AssistantMessage, request
             ? prepared.prefix.latestReminder
             : createLatestReminder(settings)
           : undefined
-        reply = { ...reply, ...(latestReminder ? { latestReminder } : {}) }
-        updateReply(sessionId, reply)
-        persist(sessionId)
-        const baseSystem = settings.systemPrompt.trim()
+        if (latestReminder && reply.latestReminder !== latestReminder) {
+          reply = { ...reply, latestReminder }
+          updateReply(sessionId, reply)
+        }
+        const sessionPrompt = getSession(sessionId)?.systemPrompt?.trim()
+        const baseSystem = sessionPrompt || settings.systemPrompt.trim()
         const voiceSystem = request.voiceCall ? settings.voiceSystemPrompt.trim() : ''
         const visionHint =
           request.voiceCall && prepared.question.files.some((file) => file.isImage)
@@ -1908,7 +2261,23 @@ const streamReply = async (sessionId: string, initial: AssistantMessage, request
           settings.chatProtocol
         )
         builtRoundCount = builtRequest.roundCount
-        const tools = serverTools(initial.search ?? false, settings.readUrl)
+        const customWebSearch =
+          initial.search &&
+          settings.webSearchChannel.mode === 'custom' &&
+          settings.webSearchChannel.endpoint.trim()
+            ? {
+                endpoint: settings.webSearchChannel.endpoint,
+                method: settings.webSearchChannel.method,
+                apiKey: settings.webSearchChannel.apiKey,
+                queryParam: settings.webSearchChannel.queryParam,
+                maxResults: settings.webSearchChannel.maxResults,
+                customHeaders: settings.webSearchChannel.customHeaders,
+              }
+            : undefined
+        const tools = serverTools(
+          Boolean(initial.search && !customWebSearch),
+          settings.readUrl
+        )
         const requestBody: CreateMessageRequest = {
           model: initial.model ?? (settings.model.trim() || MODEL),
           ...(system ? { system } : {}),
@@ -1933,7 +2302,8 @@ const streamReply = async (sessionId: string, initial: AssistantMessage, request
                 inlinePrepared.inlineImages,
                 inlinePrepared.inlineTexts,
                 settings.customHeaders,
-                settings.thinkingEffort
+                settings.thinkingEffort,
+                customWebSearch
               )
             : settings.chatProtocol === 'openai' || settings.chatProtocol === 'local'
               ? streamOpenAIMessage(
@@ -1944,9 +2314,10 @@ const streamReply = async (sessionId: string, initial: AssistantMessage, request
                   inlinePrepared.inlineImages,
                   inlinePrepared.inlineTexts,
                   settings.customHeaders,
-                  settings.thinkingEffort
+                  settings.thinkingEffort,
+                  customWebSearch
                 )
-              : streamMessage(settings.apiKey ?? '', requestBody, controller.signal)
+              : streamMessage(settings.apiKey ?? '', requestBody, controller.signal, customWebSearch)
         const blockIndexes = new Map<number, number>()
         for await (const event of events) {
           receivedContent ||= event.type === 'content_block_start'
@@ -1968,11 +2339,7 @@ const streamReply = async (sessionId: string, initial: AssistantMessage, request
             titleRequests.delete(controller)
           }
           reply = applyEvent(reply, event, Date.now(), blockIndexes)
-          if (document.visibilityState === 'hidden') {
-            flush()
-          } else {
-            frame ||= requestAnimationFrame(flush)
-          }
+          scheduleFlush()
         }
         reply = settleReply(reply, 'done', Date.now(), undefined, settings.keepRefusedContent)
 
@@ -2089,12 +2456,25 @@ const streamReply = async (sessionId: string, initial: AssistantMessage, request
           break
         }
         if (preparing) {
-          reply = settleReply(reply, 'error', Date.now(), {
-            kind: 'upload',
-            message: '',
-            localMessage: describeUploadError(error),
-            retryable: isRetryableApiError(error),
-          })
+          const hasQuestionFiles = request.question.files.length > 0
+          reply = settleReply(
+            reply,
+            'error',
+            Date.now(),
+            hasQuestionFiles
+              ? {
+                  kind: 'upload',
+                  message: error instanceof Error ? error.message : '',
+                  localMessage: describeUploadError(error),
+                  retryable: isRetryableApiError(error),
+                }
+              : {
+                  kind: 'protocol',
+                  message:
+                    error instanceof Error && error.message ? error.message : 'Request preparation failed',
+                  retryable: isRetryableApiError(error),
+                }
+          )
           break
         }
         // 附件失效：重新补传后重发。收到过内容块（含丢弃的客户端工具）后不自动重发。
@@ -2208,6 +2588,7 @@ const streamReply = async (sessionId: string, initial: AssistantMessage, request
   } finally {
     titleRequests.delete(controller)
     streamFlushes.delete(sessionId)
+    clearTimeout(flushTimer)
     cancelAnimationFrame(frame)
     if (turnUsage) {
       recordTurnTokenUsage(turnUsage)

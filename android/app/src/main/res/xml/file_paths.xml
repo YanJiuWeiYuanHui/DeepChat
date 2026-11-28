@@ -3,5 +3,6 @@
     <external-files-path name="camera_pictures" path="Pictures/" />
     <cache-path name="cache_pictures" path="Pictures/" />
     <cache-path name="updates" path="updates/" />
+    <cache-path name="share_images" path="share/" />
     <external-path name="my_images" path="Pictures/" />
 </paths>

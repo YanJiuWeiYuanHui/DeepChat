@@ -10,6 +10,7 @@ const ASSISTANT_SNIPPET_MAX = 360
 const MAX_ROUNDS_PER_SESSION = 2
 const RECENT_FALLBACK_LIMIT = 3
 const MAX_CANDIDATE_SESSIONS = 60
+const MAX_COLD_LOADS_PER_TURN = 16
 const MAX_TOKENIZE_CHARS = 1200
 
 const STOP_WORDS = new Set([
@@ -284,7 +285,9 @@ export const buildCrossChatMemory = async ({
     }
   }
 
-  for (const id of missingIds) {
+  const coldBatch =
+    scope === 'selected' ? missingIds : missingIds.slice(0, MAX_COLD_LOADS_PER_TURN)
+  for (const id of coldBatch) {
     if (signal?.aborted) {
       return ''
     }

@@ -1,6 +1,6 @@
 import { formatDate } from '../../utils/format.js'
 import * as db from './db.js'
-import { replaceHistory, useChatStore } from './store.js'
+import { mergeHistory as storeMergeHistory, replaceHistory, useChatStore, type MergeHistoryResult } from './store.js'
 import type { Session } from './types.js'
 
 export { BackupError } from './history/errors.js'
@@ -51,6 +51,19 @@ export const importHistory = (
     const { checkArchiveFormat, importArchive } = await import('./history/importArchive.js')
     const rootPrefix = await checkArchiveFormat(file)
     return replaceHistory(() => importArchive(file, onProgress, rootPrefix))
+  })
+
+/**
+ * 追加合并导入：校验 ZIP 格式并写入暂存后增量合入本地，绝不删除任何现有会话与附件。
+ */
+export const mergeHistory = (
+  file: File,
+  onProgress?: (sessions: number) => void
+): Promise<MergeHistoryResult> =>
+  enqueueBackup(async () => {
+    const { checkArchiveFormat, importArchive } = await import('./history/importArchive.js')
+    const rootPrefix = await checkArchiveFormat(file)
+    return storeMergeHistory(() => importArchive(file, onProgress, rootPrefix))
   })
 
 /** 确认删除后调用：以空历史原子替换全部本地会话与附件，保留 API Key 和其他设置。 */

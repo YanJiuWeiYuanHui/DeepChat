@@ -279,6 +279,10 @@
   display: none;
 }
 
+.collapsedToggles .toggle {
+  padding: 0 9px;
+}
+
 .toggle {
   display: inline-flex;
   flex-shrink: 0;
@@ -345,20 +349,20 @@
   cursor: pointer;
   -webkit-tap-highlight-color: transparent;
   transition: color 0.2s ease;
-}
 
-.contextRing svg {
-  width: 100%;
-  height: 100%;
-}
+  svg {
+    width: 100%;
+    height: 100%;
+  }
 
-.contextRing circle {
-  fill: none;
-  stroke-width: 2;
+  circle {
+    fill: none;
+    stroke-width: 2;
+  }
 }
 
 .contextRingTrack {
-  stroke: var(--dsw-alias-bg-skeleton);
+  stroke: var(--dsw-alias-bg-skeleton, var(--dsw-alias-border-l2));
 }
 
 .contextRingFill {
@@ -384,7 +388,7 @@
 
 /* 达到 70% 转为提醒色 */
 .contextRingWarn {
-  color: var(--dsw-static-amber-500);
+  color: var(--dsw-static-amber-500, #f59e0b);
 }
 
 /* 达到 90% 转为警示色，提示即将触发截断 */

@@ -934,3 +934,67 @@
   font-size: 11px;
   color: var(--dsw-alias-label-tertiary);
 }
+
+.presetCard {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.presetChipRow {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.presetChipWrap {
+  display: inline-flex;
+  align-items: center;
+  border-radius: 999px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  background: var(--dsw-alias-bg-layer-2);
+  overflow: hidden;
+  transition:
+    border-color 0.14s ease,
+    background-color 0.14s ease;
+}
+
+.presetChipWrapActive {
+  border-color: var(--dsw-alias-brand-primary);
+  background: rgba(77, 107, 254, 0.12);
+}
+
+.presetChipBtn {
+  padding: 5px 10px;
+  border: none;
+  background: none;
+  color: var(--dsw-alias-label-primary);
+  font: inherit;
+  font-size: 12px;
+  line-height: 16px;
+  cursor: pointer;
+
+  &:hover {
+    color: var(--dsw-alias-brand-primary);
+  }
+}
+
+.presetManageRow {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.presetCheckLabel {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--dsw-alias-label-secondary);
+  cursor: pointer;
+
+  input {
+    accent-color: var(--dsw-alias-brand-primary);
+  }
+}

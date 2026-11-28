@@ -5,8 +5,17 @@ let runtimeApiOrigin = ''
 
 export const normalizeOrigin = (value: string) => value.trim().replace(/\/+$/, '')
 
+/**
+ * 剥离误粘贴在 Base URL 末尾的具体接口路径，便于统一拼接 /models、/chat/completions 等端点。
+ */
+export const stripApiEndpointSuffix = (baseUrl: string): string =>
+  normalizeOrigin(baseUrl).replace(
+    /\/(?:chat\/completions|completions|responses|messages|models|images\/generations)$/i,
+    ''
+  )
+
 export const setRuntimeApiOrigin = (origin: string) => {
-  runtimeApiOrigin = normalizeOrigin(origin)
+  runtimeApiOrigin = stripApiEndpointSuffix(origin)
 }
 
 export const getApiOrigin = (): string => runtimeApiOrigin || API_ORIGIN
@@ -16,7 +25,7 @@ export const getApiOrigin = (): string => runtimeApiOrigin || API_ORIGIN
  * 若用户填写的 Base URL 已包含 /v1（或 /v1beta/openai 等版本后缀），则不再重复拼接 /v1。
  */
 export const joinApiPath = (baseUrl: string, v1Subpath: string): string => {
-  const base = normalizeOrigin(baseUrl) || getApiOrigin()
+  const base = stripApiEndpointSuffix(baseUrl) || getApiOrigin()
   const sub = v1Subpath.startsWith('/') ? v1Subpath : `/${v1Subpath}`
   if (/\/v\d+(?:beta)?(?:\/openai)?$/i.test(base)) {
     return `${base}${sub}`

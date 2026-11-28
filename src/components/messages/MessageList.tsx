@@ -14,7 +14,10 @@ import { clearSearchScrollTarget, useSessionSearch } from '../sider/sessionSearc
 import { AssistantMessage } from './AssistantMessage.js'
 import { ConversationTimeline, extractTimelineTurns } from './ConversationTimeline.js'
 import { ScrollToBottomContext } from './scrollContext.js'
+import { ShareBottomBar, ShareCircleCheck, ShareTopBar } from './ShareBar.js'
+import { exitShareSelect, toggleShareTurn, useShareSelect } from './shareSelectState.js'
 import { UserMessage } from './UserMessage.js'
+import type { ShareTurn } from '../../services/chat/shareImage.js'
 import type { Message } from '../../services/chat/types.js'
 import styles from './MessageList.module.css'
 
@@ -72,10 +75,21 @@ export const MessageList = ({
   const messages = useMemo(() => getVisibleMessages(session), [session])
   const attachmentOnlyLabel = t('timelineAttachmentOnly')
   const noAnswerLabel = t('timelineNoAnswer')
-  const timelineTurns = useMemo(
-    () => extractTimelineTurns(messages, attachmentOnlyLabel, noAnswerLabel),
-    [messages, attachmentOnlyLabel, noAnswerLabel]
-  )
+  // 流式输出期间若消息总条数未变，暂缓重建时间线摘要，避免每 100ms 全量扫描数百条历史消息
+  const timelineCacheRef = useRef<{
+    sessionId: string
+    count: number
+    turns: ReturnType<typeof extractTimelineTurns>
+  }>({ sessionId: '', count: -1, turns: [] })
+  const timelineTurns = useMemo(() => {
+    const cached = timelineCacheRef.current
+    if (streaming && cached.sessionId === session.id && cached.count === messages.length) {
+      return cached.turns
+    }
+    const next = extractTimelineTurns(messages, attachmentOnlyLabel, noAnswerLabel)
+    timelineCacheRef.current = { sessionId: session.id, count: messages.length, turns: next }
+    return next
+  }, [streaming, session.id, messages, attachmentOnlyLabel, noAnswerLabel])
   const turnCountRef = useRef(0)
   turnCountRef.current = timelineTurns.length
   const activeJump = useMemo(
@@ -342,11 +356,70 @@ export const MessageList = ({
     }
   }, [isMobile, scrollToBottom, timelineTurns])
 
+  const shareSessionId = useShareSelect((state) => state.sessionId)
+  const selectedTurnIds = useShareSelect((state) => state.selectedTurnIds)
+  const shareSelectActive = shareSessionId === session.id
+
+  useEffect(() => {
+    if (shareSessionId && shareSessionId !== session.id) {
+      exitShareSelect()
+    }
+  }, [session.id, shareSessionId])
+
+  const { shareTurns, messageToTurnId, turnFirstMessageIds } = useMemo(() => {
+    if (!shareSelectActive) {
+      return {
+        shareTurns: [] as ShareTurn[],
+        messageToTurnId: new Map<string, string>(),
+        turnFirstMessageIds: new Set<string>(),
+      }
+    }
+    const turns: ShareTurn[] = []
+    const msgToTurn = new Map<string, string>()
+    const firstMsgIds = new Set<string>()
+    let current: ShareTurn | null = null
+    for (const msg of messages) {
+      if (msg.role === 'user') {
+        current = { id: msg.id, user: msg }
+        turns.push(current)
+      } else if (current && !current.assistant) {
+        current.assistant = msg
+        current.id = msg.id
+        current = null
+      } else {
+        turns.push({ id: msg.id, assistant: msg })
+      }
+    }
+    for (const turn of turns) {
+      if (turn.user) {
+        msgToTurn.set(turn.user.id, turn.id)
+        firstMsgIds.add(turn.user.id)
+      }
+      if (turn.assistant) {
+        msgToTurn.set(turn.assistant.id, turn.id)
+        if (!turn.user) {
+          firstMsgIds.add(turn.assistant.id)
+        }
+      }
+    }
+    return { shareTurns: turns, messageToTurnId: msgToTurn, turnFirstMessageIds: firstMsgIds }
+  }, [shareSelectActive, messages])
+
+  const allTurnIds = useMemo(() => shareTurns.map((turn) => turn.id), [shareTurns])
+  const selectedTurnSet = useMemo(() => new Set(selectedTurnIds), [selectedTurnIds])
+  const selectedShareTurns = useMemo(
+    () => shareTurns.filter((turn) => selectedTurnSet.has(turn.id)),
+    [shareTurns, selectedTurnSet]
+  )
+
   const lastIndex = renderedMessages.length - 1
   const uploadRetryId = getUploadRetryId(messages, streaming)
   return (
     <ScrollToBottomContext.Provider value={scrollToBottom}>
       <div className={styles.host}>
+        {shareSelectActive ? (
+          <ShareTopBar allTurnIds={allTurnIds} selectedTurnIds={selectedTurnIds} />
+        ) : null}
         <div ref={isMobile ? undefined : scrollRef} className={styles.container}>
           <div ref={isMobile ? scrollRef : undefined} className={styles.scroll}>
             <div ref={contentRef} className={styles.column}>
@@ -357,13 +430,11 @@ export const MessageList = ({
                   </button>
                 </div>
               ) : null}
-              {renderedMessages.map((message, index) => (
-                <div
-                  key={message.id}
-                  data-message-id={message.id}
-                  className={clsx(highlightedId === message.id && styles.searchHighlight)}
-                >
-                  {message.role === 'user' ? (
+              {renderedMessages.map((message, index) => {
+                const turnId = messageToTurnId.get(message.id) ?? message.id
+                const showCheck = shareSelectActive && turnFirstMessageIds.has(message.id)
+                const body =
+                  message.role === 'user' ? (
                     <UserMessage
                       sessionId={session.id}
                       message={message}
@@ -384,21 +455,50 @@ export const MessageList = ({
                       versions={versions.get(message.id) ?? EMPTY_VERSIONS}
                       onSelectVersion={selectVersion}
                     />
-                  )}
-                </div>
-              ))}
+                  )
+                return (
+                  <div
+                    key={message.id}
+                    data-message-id={message.id}
+                    className={clsx(
+                      highlightedId === message.id && styles.searchHighlight,
+                      shareSelectActive && styles.shareSelectableRow
+                    )}
+                    onClick={shareSelectActive ? () => toggleShareTurn(turnId) : undefined}
+                  >
+                    {shareSelectActive ? (
+                      <>
+                        <div className={styles.shareCheckCol}>
+                          {showCheck ? (
+                            <ShareCircleCheck checked={selectedTurnSet.has(turnId)} />
+                          ) : null}
+                        </div>
+                        <div className={styles.shareContentCol}>{body}</div>
+                      </>
+                    ) : (
+                      body
+                    )}
+                  </div>
+                )
+              })}
             </div>
           </div>
-          {footer}
+          {shareSelectActive ? (
+            <ShareBottomBar title={session.title} selectedTurns={selectedShareTurns} />
+          ) : (
+            footer
+          )}
         </div>
-        <ConversationTimeline
-          sessionId={session.id}
-          title={session.title}
-          turns={timelineTurns}
-          activeTurnIndex={activeTurnIndex}
-          isMobile={isMobile}
-          onJumpToTurn={jumpToMessage}
-        />
+        {shareSelectActive ? null : (
+          <ConversationTimeline
+            sessionId={session.id}
+            title={session.title}
+            turns={timelineTurns}
+            activeTurnIndex={activeTurnIndex}
+            isMobile={isMobile}
+            onJumpToTurn={jumpToMessage}
+          />
+        )}
       </div>
     </ScrollToBottomContext.Provider>
   )

@@ -7,6 +7,7 @@ import type {
   ServiceChannelConfig,
   ServiceChannelMode,
   TtsChannelConfig,
+  WebSearchChannelConfig,
 } from '../../services/settings.js'
 import { Button } from '../base/Button.js'
 import { Select, type SelectOption } from '../base/Select.js'
@@ -18,6 +19,7 @@ export const ModelFetcherInput = ({
   baseUrl,
   apiKey,
   customHeaders = '',
+  filterNonChat = false,
   placeholder,
   onChange,
 }: {
@@ -25,6 +27,7 @@ export const ModelFetcherInput = ({
   baseUrl: string
   apiKey: string
   customHeaders?: string
+  filterNonChat?: boolean
   placeholder: string
   onChange: (model: string) => void
 }) => {
@@ -38,6 +41,8 @@ export const ModelFetcherInput = ({
   const onChangeRef = useRef(onChange)
   onChangeRef.current = onChange
   const mountedRef = useRef(true)
+  const sourceKey = `${baseUrl}\0${apiKey}\0${customHeaders}`
+  const prevSourceKeyRef = useRef(sourceKey)
 
   useEffect(() => {
     mountedRef.current = true
@@ -46,6 +51,18 @@ export const ModelFetcherInput = ({
       controllerRef.current?.abort()
     }
   }, [])
+
+  useEffect(() => {
+    if (prevSourceKeyRef.current === sourceKey) {
+      return
+    }
+    prevSourceKeyRef.current = sourceKey
+    controllerRef.current?.abort()
+    controllerRef.current = null
+    setLoading(false)
+    setModels([])
+    setStatus(null)
+  }, [sourceKey])
 
   const handleFetch = async () => {
     if (loading) {
@@ -57,7 +74,9 @@ export const ModelFetcherInput = ({
     setLoading(true)
     setStatus(null)
     try {
-      const list = await fetchAvailableModels(baseUrl, apiKey, controller.signal, customHeaders)
+      const list = await fetchAvailableModels(baseUrl, apiKey, controller.signal, customHeaders, {
+        filterNonChat,
+      })
       if (!mountedRef.current || controller.signal.aborted) {
         return
       }
@@ -291,6 +310,116 @@ export const ImageGenChannelCard = ({
               onChange={(model) => onChange({ ...channel, model })}
             />
           </div>
+        </div>
+      ) : null}
+    </div>
+  )
+}
+
+/** 自定义联网搜索工具渠道（通用 HTTP 端点 + Function Calling 自主搜索） */
+export const WebSearchChannelCard = ({
+  channel,
+  onChange,
+}: {
+  channel: WebSearchChannelConfig
+  onChange: (next: WebSearchChannelConfig) => void
+}) => {
+  const t = useTranslate()
+  const modeOptions: SelectOption<ServiceChannelMode>[] = [
+    { value: 'inherit', label: t('channelModeInherit') },
+    { value: 'custom', label: t('webSearchModeCustom') },
+  ]
+  const methodOptions: SelectOption<'POST' | 'GET'>[] = [
+    { value: 'POST', label: 'POST (JSON)' },
+    { value: 'GET', label: 'GET (Query)' },
+  ]
+
+  return (
+    <div className={styles.channelCard}>
+      <div className={styles.channelCardHeader}>
+        <div className={styles.label}>{t('channelWebSearchTitle')}</div>
+        <Select
+          value={channel.mode}
+          options={modeOptions}
+          ariaLabel={t('channelWebSearchTitle')}
+          onChange={(mode) => onChange({ ...channel, mode })}
+        />
+      </div>
+      {channel.mode === 'custom' ? (
+        <div className={styles.channelBody}>
+          <div className={styles.description}>{t('webSearchCustomDesc')}</div>
+          <label className={styles.paramItem}>
+            <span className={styles.paramLabel}>{t('webSearchEndpointLabel')}</span>
+            <input
+              type="url"
+              className={styles.textInput}
+              placeholder={t('webSearchEndpointPlaceholder')}
+              spellCheck={false}
+              value={channel.endpoint}
+              onChange={(event) => onChange({ ...channel, endpoint: event.target.value })}
+            />
+          </label>
+          <div className={styles.paramGrid}>
+            <div className={styles.paramItem}>
+              <span className={styles.paramLabel}>{t('webSearchMethodLabel')}</span>
+              <Select
+                value={channel.method}
+                options={methodOptions}
+                ariaLabel={t('webSearchMethodLabel')}
+                onChange={(method) => onChange({ ...channel, method })}
+              />
+            </div>
+            <label className={styles.paramItem}>
+              <span className={styles.paramLabel}>{t('webSearchQueryParamLabel')}</span>
+              <input
+                type="text"
+                className={styles.textInput}
+                placeholder="query"
+                spellCheck={false}
+                value={channel.queryParam}
+                onChange={(event) => onChange({ ...channel, queryParam: event.target.value })}
+              />
+            </label>
+            <label className={styles.paramItem}>
+              <span className={styles.paramLabel}>{t('webSearchMaxResultsLabel')}</span>
+              <input
+                type="number"
+                className={styles.textInput}
+                min={1}
+                max={20}
+                step={1}
+                value={channel.maxResults}
+                onChange={(event) => {
+                  const n = Number.parseInt(event.target.value, 10)
+                  if (Number.isFinite(n)) {
+                    onChange({ ...channel, maxResults: Math.min(20, Math.max(1, n)) })
+                  }
+                }}
+              />
+            </label>
+          </div>
+          <label className={styles.paramItem}>
+            <span className={styles.paramLabel}>{t('webSearchApiKeyLabel')}</span>
+            <input
+              type="password"
+              className={styles.textInput}
+              placeholder="Bearer token (optional)"
+              autoComplete="off"
+              spellCheck={false}
+              value={channel.apiKey}
+              onChange={(event) => onChange({ ...channel, apiKey: event.target.value })}
+            />
+          </label>
+          <label className={styles.paramItem}>
+            <span className={styles.paramLabel}>{t('customHeadersLabel')}</span>
+            <textarea
+              className={styles.textareaInput}
+              placeholder={t('customHeadersPlaceholder')}
+              spellCheck={false}
+              value={channel.customHeaders}
+              onChange={(event) => onChange({ ...channel, customHeaders: event.target.value })}
+            />
+          </label>
         </div>
       ) : null}
     </div>

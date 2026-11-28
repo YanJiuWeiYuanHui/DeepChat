@@ -128,8 +128,127 @@ export const loadSessionSummaries = async (): Promise<SessionSummary[]> =>
 export const loadSession = async (id: string): Promise<Session | undefined> =>
   withDB((db) => db.get('sessions', id))
 
+export const listSessionIds = async (): Promise<string[]> =>
+  withDB((db) => db.getAllKeys('sessions'))
+
 export const loadAllSessions = async (): Promise<Session[]> =>
   withDB((db) => db.getAll('sessions'))
+
+/** 申请浏览器的持久化存储配额，降低系统在空间紧张时自动回收 IndexedDB 的概率。 */
+export const requestPersistentStorage = async (): Promise<boolean | null> => {
+  if (typeof navigator === 'undefined' || !navigator.storage) {
+    return null
+  }
+  try {
+    if (typeof navigator.storage.persisted === 'function' && (await navigator.storage.persisted())) {
+      return true
+    }
+    if (typeof navigator.storage.persist === 'function') {
+      return await navigator.storage.persist()
+    }
+  } catch {
+    return false
+  }
+  return null
+}
+
+/**
+ * 轻量自愈：按主键对比 sessions 主表与 sessionSummaries 摘要表，
+ * 仅逐条读取缺少摘要的会话重建列表索引，避免一次性 getAll 引发超大库 OOM。
+ */
+export const repairMissingSessionSummaries = async (): Promise<{
+  repaired: number
+  totalSessions: number
+}> =>
+  withDB(async (db) => {
+    const [sessionKeys, summaryKeys] = await Promise.all([
+      db.getAllKeys('sessions'),
+      db.getAllKeys('sessionSummaries'),
+    ])
+    const existing = new Set(summaryKeys)
+    const missing = sessionKeys.filter((id) => !existing.has(id))
+    let repaired = 0
+    for (const id of missing) {
+      try {
+        const session = await db.get('sessions', id)
+        if (session && typeof session.id === 'string' && Array.isArray(session.messages)) {
+          await db.put('sessionSummaries', storedSummary(session))
+          repaired += 1
+        }
+      } catch (error) {
+        reportStorageError('repair session summary')(error)
+      }
+    }
+    return { repaired, totalSessions: sessionKeys.length }
+  })
+
+export type IndexedDBDiagnostics = {
+  sessionsCount: number
+  summariesCount: number
+  filesCount: number
+  filesBytes: number
+  stagingCount: number
+  filesStagingCount: number
+  webUsageBytes: number | null
+  idbDatabases: string[]
+  persisted: boolean | null
+}
+
+/** 读取本地 IndexedDB 各存储表的条数、附件总大小、库名列表与持久化状态。 */
+export const getIndexedDBDiagnostics = async (): Promise<IndexedDBDiagnostics> => {
+  const [counts, persisted, estimate, databases] = await Promise.all([
+    withDB(async (db) => {
+      const [sessionsCount, summariesCount, fileKeys, stagingCount, filesStagingCount] =
+        await Promise.all([
+          db.count('sessions'),
+          db.count('sessionSummaries'),
+          db.getAllKeys('files'),
+          db.count('sessionsStaging'),
+          db.count('filesStaging'),
+        ])
+      let filesBytes = 0
+      for (const key of fileKeys) {
+        try {
+          const record = await db.get('files', key)
+          if (record?.blob) {
+            filesBytes += record.blob.size
+          }
+        } catch {
+          // 忽略单条损坏读取
+        }
+      }
+      return {
+        sessionsCount,
+        summariesCount,
+        filesCount: fileKeys.length,
+        filesBytes,
+        stagingCount,
+        filesStagingCount,
+      }
+    }),
+    typeof navigator !== 'undefined' && typeof navigator.storage?.persisted === 'function'
+      ? navigator.storage.persisted().catch(() => null)
+      : Promise.resolve(null),
+    typeof navigator !== 'undefined' && typeof navigator.storage?.estimate === 'function'
+      ? navigator.storage.estimate().catch(() => null)
+      : Promise.resolve(null),
+    typeof indexedDB !== 'undefined' && typeof indexedDB.databases === 'function'
+      ? indexedDB.databases().catch(() => [])
+      : Promise.resolve([]),
+  ])
+  const webUsageBytes =
+    estimate && typeof estimate.usage === 'number' && Number.isFinite(estimate.usage)
+      ? estimate.usage
+      : null
+  const idbDatabases = databases
+    .map((entry) =>
+      entry.name
+        ? `${entry.name}${typeof entry.version === 'number' ? `(v${entry.version})` : ''}`
+        : ''
+    )
+    .filter(Boolean)
+  return { ...counts, webUsageBytes, idbDatabases, persisted }
+}
 
 export const saveSession = async (session: Session, files: StoredFile[] = []): Promise<void> =>
   withDB(async (db) => {
@@ -354,14 +473,127 @@ export const commitStaging = async (): Promise<SessionSummary[]> =>
     }
     await Promise.all([
       (async () => {
-        await move('sessionsStaging', 'sessions', 100)
-        await move('filesStaging', 'files', 20)
+        await move('sessionsStaging', 'sessions', 15)
+        await move('filesStaging', 'files', 5)
       })(),
       tx.done,
     ])
     // 直接返回本次提交的列表，调用方无需在替换成功后再发起可能失败的读取。
     return summaries
   })
+
+export type MergeStagingResult = {
+  summaries: SessionSummary[]
+  added: number
+  updated: number
+  kept: number
+  updatedIds: string[]
+  filesAdded: number
+}
+
+const shouldPreferStagedSession = (staged: Session, existing: Session): boolean => {
+  if (staged.messages.length !== existing.messages.length) {
+    return staged.messages.length > existing.messages.length
+  }
+  return staged.updatedAt > existing.updatedAt
+}
+
+/**
+ * 追加合并导入提交：绝不清空或删除正式库里的任何既有对话与文件。
+ * 按小批量短事务逐批从暂存合并到正式库，既防止超大备份引发移动端 WebView OOM，
+ * 也能确保哪怕中途意外中断也绝不伤害已有存档；同 ID 会话自动保留消息更多/更晚的版本。
+ */
+export const mergeStaging = async (): Promise<MergeStagingResult> => {
+  const fileKeys = await withDB((db) => db.getAllKeys('filesStaging'))
+  let filesAdded = 0
+  const FILE_MERGE_BATCH = 5
+  for (let i = 0; i < fileKeys.length; i += FILE_MERGE_BATCH) {
+    const batch = fileKeys.slice(i, i + FILE_MERGE_BATCH)
+    filesAdded += await withDB(async (db) => {
+      const tx = db.transaction(['files', 'filesStaging'], 'readwrite')
+      const targetFiles = tx.objectStore('files')
+      const stagingFiles = tx.objectStore('filesStaging')
+      let batchCount = 0
+      try {
+        for (const id of batch) {
+          const [staged, existingKey] = await Promise.all([
+            stagingFiles.get(id),
+            targetFiles.getKey(id),
+          ])
+          if (staged && existingKey === undefined) {
+            await targetFiles.put(staged)
+            batchCount += 1
+          }
+          await stagingFiles.delete(id)
+        }
+        await tx.done
+        return batchCount
+      } catch (error) {
+        abortTransaction(tx)
+        throw error
+      }
+    })
+  }
+
+  const sessionKeys = await withDB((db) => db.getAllKeys('sessionsStaging'))
+  let added = 0
+  let updated = 0
+  let kept = 0
+  const updatedIds: string[] = []
+  const SESSION_MERGE_BATCH = 10
+  for (let i = 0; i < sessionKeys.length; i += SESSION_MERGE_BATCH) {
+    const batch = sessionKeys.slice(i, i + SESSION_MERGE_BATCH)
+    const batchResult = await withDB(async (db) => {
+      const tx = db.transaction(['sessions', 'sessionSummaries', 'sessionsStaging'], 'readwrite')
+      const targetSessions = tx.objectStore('sessions')
+      const targetSummaries = tx.objectStore('sessionSummaries')
+      const stagingSessions = tx.objectStore('sessionsStaging')
+      let batchAdded = 0
+      let batchUpdated = 0
+      let batchKept = 0
+      const batchUpdatedIds: string[] = []
+      try {
+        for (const id of batch) {
+          const [staged, existing] = await Promise.all([
+            stagingSessions.get(id),
+            targetSessions.get(id),
+          ])
+          if (staged && typeof staged.id === 'string' && Array.isArray(staged.messages)) {
+            if (!existing) {
+              await targetSessions.put(staged)
+              await targetSummaries.put(storedSummary(staged))
+              batchAdded += 1
+            } else if (shouldPreferStagedSession(staged, existing)) {
+              const merged: Session =
+                staged.pinnedAt === undefined && existing.pinnedAt !== undefined
+                  ? { ...staged, pinnedAt: existing.pinnedAt }
+                  : staged
+              await targetSessions.put(merged)
+              await targetSummaries.put(storedSummary(merged))
+              batchUpdated += 1
+              batchUpdatedIds.push(merged.id)
+            } else {
+              batchKept += 1
+            }
+          }
+          await stagingSessions.delete(id)
+        }
+        await tx.done
+        return { batchAdded, batchUpdated, batchKept, batchUpdatedIds }
+      } catch (error) {
+        abortTransaction(tx)
+        throw error
+      }
+    })
+    added += batchResult.batchAdded
+    updated += batchResult.batchUpdated
+    kept += batchResult.batchKept
+    updatedIds.push(...batchResult.batchUpdatedIds)
+  }
+
+  const summaries = await loadSessionSummaries()
+  return { summaries, added, updated, kept, updatedIds, filesAdded }
+}
 
 /** 本地存储失败不打断对话，只在控制台留痕 */
 export const reportStorageError = (action: string) => (error: unknown) => {

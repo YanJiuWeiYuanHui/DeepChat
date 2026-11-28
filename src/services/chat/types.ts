@@ -124,6 +124,8 @@ export type Session = {
   updatedAt: number
   /** 置顶时间戳（毫秒）；存在时会话始终排在顶部置顶区。 */
   pinnedAt?: number
+  /** 当前会话专属系统提示词；留空或未设置时继承全局系统提示词。 */
+  systemPrompt?: string
   /** 包含所有分支的消息，按创建顺序存储。 */
   messages: Message[]
   /** undefined 表示线性消息列表；null 表示空会话。 */

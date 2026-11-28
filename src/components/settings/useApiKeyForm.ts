@@ -62,5 +62,10 @@ export const useApiKeyForm = (onSaved?: () => void) => {
     }
   }
 
-  return { value, setValue, verifying, error, submit, saveDirect }
+  const reset = () => {
+    setValue('')
+    setFailure(null)
+  }
+
+  return { value, setValue, verifying, error, submit, saveDirect, reset }
 }

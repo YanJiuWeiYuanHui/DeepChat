@@ -10,10 +10,22 @@
   line-height: 22px;
   color: var(--dsw-alias-label-primary);
   cursor: pointer;
+  content-visibility: auto;
+  contain-intrinsic-size: 40px;
+  -webkit-touch-callout: none;
+  user-select: none;
 
   &.active {
     background-color: var(--dsw-specific-sidebar-nav-item-active-accent);
     color: var(--dsw-alias-brand-primary-invert);
+  }
+
+  &.selected {
+    background-color: var(--dsw-specific-sidebar-nav-item-hover);
+  }
+
+  &.selectMode {
+    touch-action: pan-y;
   }
 
   @media (hover: hover) {
@@ -73,6 +85,7 @@
     padding: 11px 6px 11px 12px;
     border-radius: 16px;
     font-size: 16px;
+    contain-intrinsic-size: 44px;
   }
 
   .title {
@@ -94,4 +107,26 @@
   margin-left: 4px;
   color: var(--dsw-alias-brand-primary);
   opacity: 0.78;
+}
+
+.checkbox {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 18px;
+  height: 18px;
+  margin-right: 8px;
+  border: 1.5px solid var(--dsw-alias-border-l2);
+  border-radius: 6px;
+  box-sizing: border-box;
+  transition:
+    background-color 0.14s ease,
+    border-color 0.14s ease;
+}
+
+.checkboxChecked {
+  border-color: var(--dsw-alias-brand-primary);
+  background-color: var(--dsw-alias-brand-primary);
+  color: var(--dsw-static-neutral-bluish-00, #fff);
 }

@@ -172,12 +172,19 @@ export type DeepseekReadUrlTool = {
   name: 'deepseek_read_url'
 }
 
+/** 客户端自定义工具声明（Anthropic Messages 协议） */
+export type CustomClientTool = {
+  name: string
+  description: string
+  input_schema: Record<string, unknown>
+}
+
 export type CreateMessageRequest = {
   model: ChatModel
   system?: string
   messages: MessageParam[]
   thinking: { type: 'enabled' | 'disabled' }
-  tools?: (DeepseekWebSearchTool | DeepseekReadUrlTool)[]
+  tools?: (DeepseekWebSearchTool | DeepseekReadUrlTool | CustomClientTool)[]
   safety_check?: { level: 'high' }
   temperature?: number
   top_p?: number

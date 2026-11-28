@@ -8,6 +8,7 @@ import { newChat } from '../../services/chat/store.js'
 import { ChatInput } from '../chatInput/ChatInput.js'
 import { MessageList } from '../messages/MessageList.js'
 import { AutoPlayVoiceButton, MobileHeader } from './MobileHeader.js'
+import { SessionPromptButton } from './SessionPromptButton.js'
 import styles from './SessionView.module.css'
 
 /** 会话页：标题栏（移动端为顶栏）+ 消息列表，输入框吸底 */
@@ -26,13 +27,14 @@ export const SessionView = ({
   return (
     <div className={styles.view}>
       {isMobile ? (
-        <MobileHeader title={title} />
+        <MobileHeader title={title} session={session} />
       ) : (
         <div className={styles.header}>
           <div className={clsx(styles.title, siderCollapsed && styles.withCollapsedSider)}>
             {title}
           </div>
           <div className={styles.headerActions}>
+            <SessionPromptButton session={session} size="m" />
             <AutoPlayVoiceButton size="m" />
             <IconButton
               size="m"

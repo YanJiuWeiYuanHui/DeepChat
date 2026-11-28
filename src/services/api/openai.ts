@@ -1,7 +1,46 @@
 import { ApiError, request } from './client.js'
 import { joinApiPath, parseCustomHeaders } from './origin.js'
 import { readServerSentEvents } from './sse.js'
-import type { CreateMessageRequest, MessageStreamEvent, MessageUsage } from './types.js'
+import type {
+  CreateMessageRequest,
+  MessageStreamEvent,
+  MessageUsage,
+  WebSearchResult,
+} from './types.js'
+import { executeCustomWebSearch, type CustomWebSearchConfig } from './webSearch.js'
+
+const MAX_WEB_SEARCH_ROUNDS = 4
+
+const WEB_SEARCH_TOOL_DESCRIPTION =
+  'Search the web for up-to-date facts, news, or documentation. Returns titles, URLs, and snippets.'
+
+const WEB_SEARCH_TOOL_PARAMETERS = {
+  type: 'object',
+  properties: {
+    query: {
+      type: 'string',
+      description: 'Concise search query keywords',
+    },
+  },
+  required: ['query'],
+}
+
+const parseSearchQueryArg = (rawArgs: string): string => {
+  try {
+    const parsed: unknown = JSON.parse(rawArgs)
+    if (typeof parsed === 'object' && parsed !== null) {
+      const obj = parsed as Record<string, unknown>
+      for (const key of ['query', 'q', 'keywords', 'keyword', 'search_query']) {
+        if (typeof obj[key] === 'string' && obj[key].trim()) {
+          return obj[key].trim()
+        }
+      }
+    }
+  } catch {
+    // 非法 JSON 时退回原始文本
+  }
+  return rawArgs.trim()
+}
 
 const toUsageInt = (value: unknown): number =>
   typeof value === 'number' && Number.isFinite(value) && value >= 0 ? Math.round(value) : 0
@@ -209,38 +248,19 @@ export async function* streamOpenAIMessage(
   inlineImages: ReadonlyMap<string, string> = new Map(),
   inlineTexts: ReadonlyMap<string, string> = new Map(),
   customHeadersRaw = '',
-  thinkingEffort?: ReasoningEffort
+  thinkingEffort?: ReasoningEffort,
+  webSearchConfig?: CustomWebSearchConfig
 ): AsyncGenerator<MessageStreamEvent> {
   const url = joinApiPath(baseUrl, '/chat/completions')
   const effort = mapReasoningEffort(thinkingEffort)
-  const payload: Record<string, unknown> = {
-    model: body.model,
-    messages: toOpenAIMessages(body, inlineImages, inlineTexts),
-    stream: true,
-    stream_options: { include_usage: true },
-    ...(body.thinking.type === 'enabled' && effort ? { reasoning_effort: effort } : {}),
-    ...(body.temperature !== undefined ? { temperature: body.temperature } : {}),
-    ...(body.top_p !== undefined ? { top_p: body.top_p } : {}),
-    ...(body.max_tokens !== undefined ? { max_tokens: body.max_tokens } : {}),
-  }
-
-  const response = await request(url, {
-    method: 'POST',
-    headers: {
-      ...buildAuthHeaders(apiKey, customHeadersRaw),
-      Accept: 'text/event-stream',
-    },
-    body: JSON.stringify(payload),
-    signal,
-  })
-
-  if (!response.body) {
-    throw new ApiError('protocol', '')
-  }
+  const conversation: Record<string, unknown>[] = toOpenAIMessages(
+    body,
+    inlineImages,
+    inlineTexts
+  ) as Record<string, unknown>[]
+  const canSearch = Boolean(webSearchConfig?.endpoint.trim())
 
   let started = false
-  let thinkingIndex: number | null = null
-  let textIndex: number | null = null
   let nextBlockIndex = 0
   let finishReason: 'end_turn' | 'max_tokens' | 'refusal' = 'end_turn'
   let usage: MessageUsage | undefined
@@ -255,205 +275,106 @@ export async function* streamOpenAIMessage(
     }
   }
 
-  for await (const { data } of readServerSentEvents(response.body, signal)) {
-    const trimmed = data.trim()
-    if (!trimmed || trimmed === '[DONE]') {
-      if (trimmed === '[DONE]') {
-        break
-      }
-      continue
-    }
-    let chunk: unknown
-    try {
-      chunk = JSON.parse(trimmed)
-    } catch {
-      continue
-    }
-    if (typeof chunk !== 'object' || chunk === null) {
-      continue
-    }
-    const obj = chunk as Record<string, unknown>
-    if (
-      typeof obj.error === 'object' &&
-      obj.error !== null &&
-      typeof (obj.error as Record<string, unknown>).message === 'string'
-    ) {
-      throw new ApiError('stream', (obj.error as Record<string, unknown>).message as string)
-    }
-    if (obj.usage !== undefined) {
-      usage = parseOpenAIUsage(obj.usage) ?? usage
-    }
-    const choices = Array.isArray(obj.choices) ? obj.choices : []
-    const choice = choices[0] as Record<string, unknown> | undefined
-    if (!choice) {
-      continue
-    }
-    if (typeof choice.finish_reason === 'string') {
-      finishReason = mapFinishReason(choice.finish_reason)
-    }
-    const delta =
-      typeof choice.delta === 'object' && choice.delta !== null
-        ? (choice.delta as Record<string, unknown>)
-        : undefined
-    if (!delta) {
-      continue
+  for (let round = 0; round <= MAX_WEB_SEARCH_ROUNDS; round += 1) {
+    const enableToolsThisRound = canSearch && round < MAX_WEB_SEARCH_ROUNDS
+    const payload: Record<string, unknown> = {
+      model: body.model,
+      messages: conversation,
+      stream: true,
+      stream_options: { include_usage: true },
+      ...(body.thinking.type === 'enabled' && effort ? { reasoning_effort: effort } : {}),
+      ...(enableToolsThisRound
+        ? {
+            tools: [
+              {
+                type: 'function',
+                function: {
+                  name: 'web_search',
+                  description: WEB_SEARCH_TOOL_DESCRIPTION,
+                  parameters: WEB_SEARCH_TOOL_PARAMETERS,
+                },
+              },
+            ],
+            tool_choice: 'auto',
+          }
+        : {}),
+      ...(body.temperature !== undefined ? { temperature: body.temperature } : {}),
+      ...(body.top_p !== undefined ? { top_p: body.top_p } : {}),
+      ...(body.max_tokens !== undefined ? { max_tokens: body.max_tokens } : {}),
     }
 
-    const reasoningDelta =
-      typeof delta.reasoning_content === 'string'
-        ? delta.reasoning_content
-        : typeof delta.reasoning === 'string'
-          ? delta.reasoning
-          : ''
-    if (reasoningDelta) {
-      yield* ensureStart()
-      if (thinkingIndex === null) {
-        thinkingIndex = nextBlockIndex++
-        yield {
-          type: 'content_block_start',
-          index: thinkingIndex,
-          content_block: { type: 'thinking', thinking: '', signature: '' },
+    const response = await request(url, {
+      method: 'POST',
+      headers: {
+        ...buildAuthHeaders(apiKey, customHeadersRaw),
+        Accept: 'text/event-stream',
+      },
+      body: JSON.stringify(payload),
+      signal,
+    })
+
+    if (!response.body) {
+      throw new ApiError('protocol', '')
+    }
+
+    let thinkingIndex: number | null = null
+    let textIndex: number | null = null
+    let roundText = ''
+    let roundReasoning = ''
+    const toolCalls = new Map<number, { id: string; name: string; arguments: string }>()
+
+    for await (const { data } of readServerSentEvents(response.body, signal)) {
+      const trimmed = data.trim()
+      if (!trimmed || trimmed === '[DONE]') {
+        if (trimmed === '[DONE]') {
+          break
         }
+        continue
       }
-      yield {
-        type: 'content_block_delta',
-        index: thinkingIndex,
-        delta: { type: 'thinking_delta', thinking: reasoningDelta },
+      let chunk: unknown
+      try {
+        chunk = JSON.parse(trimmed)
+      } catch {
+        continue
       }
-    }
-
-    const textDelta = typeof delta.content === 'string' ? delta.content : ''
-    if (textDelta) {
-      yield* ensureStart()
-      if (thinkingIndex !== null && textIndex === null) {
-        yield { type: 'content_block_stop', index: thinkingIndex }
+      if (typeof chunk !== 'object' || chunk === null) {
+        continue
       }
-      if (textIndex === null) {
-        textIndex = nextBlockIndex++
-        yield {
-          type: 'content_block_start',
-          index: textIndex,
-          content_block: { type: 'text', text: '' },
-        }
+      const obj = chunk as Record<string, unknown>
+      if (
+        typeof obj.error === 'object' &&
+        obj.error !== null &&
+        typeof (obj.error as Record<string, unknown>).message === 'string'
+      ) {
+        throw new ApiError('stream', (obj.error as Record<string, unknown>).message as string)
       }
-      yield {
-        type: 'content_block_delta',
-        index: textIndex,
-        delta: { type: 'text_delta', text: textDelta },
+      if (obj.usage !== undefined) {
+        usage = parseOpenAIUsage(obj.usage) ?? usage
       }
-    }
-  }
-
-  yield* ensureStart()
-  if (thinkingIndex !== null && textIndex === null) {
-    yield { type: 'content_block_stop', index: thinkingIndex }
-  }
-  if (textIndex !== null) {
-    yield { type: 'content_block_stop', index: textIndex }
-  }
-  yield {
-    type: 'message_delta',
-    delta: { stop_reason: finishReason, stop_sequence: null },
-    ...(usage ? { usage } : {}),
-  }
-  yield { type: 'message_stop' }
-}
-
-/**
- * 调用 OpenAI Responses API (/v1/responses) 流式接口，并转换为统一 MessageStreamEvent。
- */
-export async function* streamResponsesMessage(
-  baseUrl: string,
-  apiKey: string,
-  body: CreateMessageRequest,
-  signal: AbortSignal,
-  inlineImages: ReadonlyMap<string, string> = new Map(),
-  inlineTexts: ReadonlyMap<string, string> = new Map(),
-  customHeadersRaw = '',
-  thinkingEffort?: ReasoningEffort
-): AsyncGenerator<MessageStreamEvent> {
-  const url = joinApiPath(baseUrl, '/responses')
-  const effort = mapReasoningEffort(thinkingEffort)
-  const payload: Record<string, unknown> = {
-    model: body.model,
-    ...(body.system?.trim() ? { instructions: body.system.trim() } : {}),
-    input: toResponsesInput(body, inlineImages, inlineTexts),
-    stream: true,
-    store: false,
-    ...(body.thinking.type === 'enabled' && effort ? { reasoning: { effort } } : {}),
-    ...(body.temperature !== undefined ? { temperature: body.temperature } : {}),
-    ...(body.top_p !== undefined ? { top_p: body.top_p } : {}),
-    ...(body.max_tokens !== undefined ? { max_output_tokens: body.max_tokens } : {}),
-  }
-
-  const response = await request(url, {
-    method: 'POST',
-    headers: {
-      ...buildAuthHeaders(apiKey, customHeadersRaw),
-      Accept: 'text/event-stream',
-    },
-    body: JSON.stringify(payload),
-    signal,
-  })
-
-  if (!response.body) {
-    throw new ApiError('protocol', '')
-  }
-
-  let started = false
-  let thinkingIndex: number | null = null
-  let textIndex: number | null = null
-  let nextBlockIndex = 0
-  let finishReason: 'end_turn' | 'max_tokens' | 'refusal' = 'end_turn'
-  let usage: MessageUsage | undefined
-  let receivedTextDelta = false
-
-  const ensureStart = function* () {
-    if (!started) {
-      started = true
-      yield {
-        type: 'message_start',
-        message: { id: `resp_${Date.now()}`, model: body.model },
-      } satisfies MessageStreamEvent
-    }
-  }
-
-  for await (const { event: eventName, data } of readServerSentEvents(response.body, signal)) {
-    const trimmed = data.trim()
-    if (!trimmed || trimmed === '[DONE]') {
-      if (trimmed === '[DONE]') {
-        break
+      const choices = Array.isArray(obj.choices) ? obj.choices : []
+      const choice = choices[0] as Record<string, unknown> | undefined
+      if (!choice) {
+        continue
       }
-      continue
-    }
-    let chunk: unknown
-    try {
-      chunk = JSON.parse(trimmed)
-    } catch {
-      continue
-    }
-    if (typeof chunk !== 'object' || chunk === null) {
-      continue
-    }
-    const obj = chunk as Record<string, unknown>
-    const type = typeof obj.type === 'string' ? obj.type : eventName
+      if (typeof choice.finish_reason === 'string') {
+        finishReason = mapFinishReason(choice.finish_reason)
+      }
+      const delta =
+        typeof choice.delta === 'object' && choice.delta !== null
+          ? (choice.delta as Record<string, unknown>)
+          : undefined
+      if (!delta) {
+        continue
+      }
 
-    if (type === 'error' || type === 'response.failed') {
-      const errObj =
-        (obj.error as Record<string, unknown> | undefined) ??
-        ((obj.response as Record<string, unknown> | undefined)?.error as
-          | Record<string, unknown>
-          | undefined)
-      const msg = typeof errObj?.message === 'string' ? errObj.message : 'Responses API error'
-      throw new ApiError('stream', msg)
-    }
-
-    if (
-      type === 'response.reasoning_summary_text.delta' ||
-      type === 'response.reasoning_text.delta'
-    ) {
-      const delta = typeof obj.delta === 'string' ? obj.delta : ''
-      if (delta) {
+      const reasoningDelta =
+        typeof delta.reasoning_content === 'string'
+          ? delta.reasoning_content
+          : typeof delta.reasoning === 'string'
+            ? delta.reasoning
+            : ''
+      if (reasoningDelta) {
+        roundReasoning += reasoningDelta
         yield* ensureStart()
         if (thinkingIndex === null) {
           thinkingIndex = nextBlockIndex++
@@ -466,19 +387,46 @@ export async function* streamResponsesMessage(
         yield {
           type: 'content_block_delta',
           index: thinkingIndex,
-          delta: { type: 'thinking_delta', thinking: delta },
+          delta: { type: 'thinking_delta', thinking: reasoningDelta },
         }
       }
-      continue
-    }
 
-    if (type === 'response.output_text.delta') {
-      const delta = typeof obj.delta === 'string' ? obj.delta : ''
-      if (delta) {
-        receivedTextDelta = true
+      if (Array.isArray(delta.tool_calls)) {
+        for (const rawTc of delta.tool_calls) {
+          if (typeof rawTc !== 'object' || rawTc === null) {
+            continue
+          }
+          const tc = rawTc as Record<string, unknown>
+          const idx = typeof tc.index === 'number' ? tc.index : toolCalls.size
+          const existing = toolCalls.get(idx) ?? {
+            id: `call_${round}_${idx}`,
+            name: '',
+            arguments: '',
+          }
+          if (typeof tc.id === 'string' && tc.id) {
+            existing.id = tc.id
+          }
+          const fn =
+            typeof tc.function === 'object' && tc.function !== null
+              ? (tc.function as Record<string, unknown>)
+              : undefined
+          if (typeof fn?.name === 'string' && fn.name) {
+            existing.name += fn.name
+          }
+          if (typeof fn?.arguments === 'string' && fn.arguments) {
+            existing.arguments += fn.arguments
+          }
+          toolCalls.set(idx, existing)
+        }
+      }
+
+      const textDelta = typeof delta.content === 'string' ? delta.content : ''
+      if (textDelta) {
+        roundText += textDelta
         yield* ensureStart()
         if (thinkingIndex !== null && textIndex === null) {
           yield { type: 'content_block_stop', index: thinkingIndex }
+          thinkingIndex = null
         }
         if (textIndex === null) {
           textIndex = nextBlockIndex++
@@ -491,55 +439,457 @@ export async function* streamResponsesMessage(
         yield {
           type: 'content_block_delta',
           index: textIndex,
-          delta: { type: 'text_delta', text: delta },
+          delta: { type: 'text_delta', text: textDelta },
         }
       }
-      continue
     }
 
-    if (type === 'response.output_text.done' && !receivedTextDelta) {
-      const full = typeof obj.text === 'string' ? obj.text : ''
-      if (full) {
-        yield* ensureStart()
-        if (textIndex === null) {
-          textIndex = nextBlockIndex++
-          yield {
-            type: 'content_block_start',
-            index: textIndex,
-            content_block: { type: 'text', text: '' },
-          }
+    if (thinkingIndex !== null) {
+      yield { type: 'content_block_stop', index: thinkingIndex }
+      thinkingIndex = null
+    }
+    if (textIndex !== null) {
+      yield { type: 'content_block_stop', index: textIndex }
+      textIndex = null
+    }
+
+    const searchCalls = [...toolCalls.values()].filter((tc) => tc.name.trim() === 'web_search')
+    if (!webSearchConfig || searchCalls.length === 0 || round >= MAX_WEB_SEARCH_ROUNDS) {
+      break
+    }
+
+    const queries = searchCalls
+      .map((tc) => parseSearchQueryArg(tc.arguments))
+      .filter((q) => q.length > 0)
+    const toolUseId = `custom_search_${Date.now()}_${round}`
+    yield* ensureStart()
+    const useBlockIndex = nextBlockIndex++
+    yield {
+      type: 'content_block_start',
+      index: useBlockIndex,
+      content_block: {
+        type: 'server_tool_use',
+        id: toolUseId,
+        name: 'deepseek_web_search',
+        input: { action: 'search', queries: queries.length > 0 ? queries : ['web search'] },
+        caller: { type: 'direct' },
+        kind: 'deep_search',
+      },
+    }
+    yield { type: 'content_block_stop', index: useBlockIndex }
+
+    const outcomes = await Promise.all(
+      searchCalls.map(async (tc) => {
+        const query = parseSearchQueryArg(tc.arguments)
+        try {
+          const res = await executeCustomWebSearch(query, webSearchConfig, signal)
+          return { call: tc, results: res.results, output: res.toolOutputText, failed: false }
+        } catch (err) {
+          signal.throwIfAborted()
+          const msg = err instanceof Error ? err.message : String(err)
+          return { call: tc, results: [] as WebSearchResult[], output: `Search error: ${msg}`, failed: true }
         }
-        yield {
-          type: 'content_block_delta',
-          index: textIndex,
-          delta: { type: 'text_delta', text: full },
+      })
+    )
+
+    const mergedResults: WebSearchResult[] = []
+    const seenUrls = new Set<string>()
+    for (const outcome of outcomes) {
+      for (const item of outcome.results) {
+        if (item.url && seenUrls.has(item.url)) {
+          continue
         }
+        if (item.url) {
+          seenUrls.add(item.url)
+        }
+        mergedResults.push(item)
       }
-      continue
     }
-
-    if (type === 'response.completed' || type === 'response.incomplete') {
-      const respObj = obj.response as Record<string, unknown> | undefined
-      usage = parseOpenAIUsage(respObj?.usage ?? obj.usage) ?? usage
+    const allFailed = outcomes.every((item) => item.failed)
+    const resultBlockIndex = nextBlockIndex++
+    yield {
+      type: 'content_block_start',
+      index: resultBlockIndex,
+      content_block: {
+        type: 'web_search_tool_result',
+        tool_use_id: toolUseId,
+        kind: 'deep_search',
+        content:
+          mergedResults.length > 0
+            ? mergedResults
+            : allFailed
+              ? [{ type: 'web_search_tool_result_error', error_code: 'unavailable' }]
+              : [],
+      },
     }
+    yield { type: 'content_block_stop', index: resultBlockIndex }
 
-    if (type === 'response.incomplete') {
-      const reason = (
-        (obj.response as Record<string, unknown> | undefined)?.incomplete_details as
-          | Record<string, unknown>
-          | undefined
-      )?.reason
-      finishReason = mapFinishReason(reason)
+    conversation.push({
+      role: 'assistant',
+      content: roundText || null,
+      ...(roundReasoning ? { reasoning_content: roundReasoning } : {}),
+      tool_calls: searchCalls.map((tc) => ({
+        id: tc.id,
+        type: 'function',
+        function: { name: tc.name.trim(), arguments: tc.arguments || '{}' },
+      })),
+    })
+    for (const outcome of outcomes) {
+      conversation.push({
+        role: 'tool',
+        tool_call_id: outcome.call.id,
+        content: outcome.output,
+      })
     }
   }
 
   yield* ensureStart()
-  if (thinkingIndex !== null && textIndex === null) {
-    yield { type: 'content_block_stop', index: thinkingIndex }
+  yield {
+    type: 'message_delta',
+    delta: { stop_reason: finishReason, stop_sequence: null },
+    ...(usage ? { usage } : {}),
   }
-  if (textIndex !== null) {
-    yield { type: 'content_block_stop', index: textIndex }
+  yield { type: 'message_stop' }
+}
+
+/**
+ * 调用 OpenAI Responses API (/v1/responses) 流式接口，并转换为统一 MessageStreamEvent（支持自定义联网 Function Calling）。
+ */
+export async function* streamResponsesMessage(
+  baseUrl: string,
+  apiKey: string,
+  body: CreateMessageRequest,
+  signal: AbortSignal,
+  inlineImages: ReadonlyMap<string, string> = new Map(),
+  inlineTexts: ReadonlyMap<string, string> = new Map(),
+  customHeadersRaw = '',
+  thinkingEffort?: ReasoningEffort,
+  webSearchConfig?: CustomWebSearchConfig
+): AsyncGenerator<MessageStreamEvent> {
+  const url = joinApiPath(baseUrl, '/responses')
+  const effort = mapReasoningEffort(thinkingEffort)
+  const inputItems: unknown[] = [...toResponsesInput(body, inlineImages, inlineTexts)]
+  const canSearch = Boolean(webSearchConfig?.endpoint.trim())
+
+  let started = false
+  let nextBlockIndex = 0
+  let finishReason: 'end_turn' | 'max_tokens' | 'refusal' = 'end_turn'
+  let usage: MessageUsage | undefined
+
+  const ensureStart = function* () {
+    if (!started) {
+      started = true
+      yield {
+        type: 'message_start',
+        message: { id: `resp_${Date.now()}`, model: body.model },
+      } satisfies MessageStreamEvent
+    }
   }
+
+  for (let round = 0; round <= MAX_WEB_SEARCH_ROUNDS; round += 1) {
+    const enableToolsThisRound = canSearch && round < MAX_WEB_SEARCH_ROUNDS
+    const payload: Record<string, unknown> = {
+      model: body.model,
+      ...(body.system?.trim() ? { instructions: body.system.trim() } : {}),
+      input: inputItems,
+      stream: true,
+      store: false,
+      ...(body.thinking.type === 'enabled' && effort ? { reasoning: { effort } } : {}),
+      ...(enableToolsThisRound
+        ? {
+            tools: [
+              {
+                type: 'function',
+                name: 'web_search',
+                description: WEB_SEARCH_TOOL_DESCRIPTION,
+                parameters: WEB_SEARCH_TOOL_PARAMETERS,
+              },
+            ],
+            tool_choice: 'auto',
+          }
+        : {}),
+      ...(body.temperature !== undefined ? { temperature: body.temperature } : {}),
+      ...(body.top_p !== undefined ? { top_p: body.top_p } : {}),
+      ...(body.max_tokens !== undefined ? { max_output_tokens: body.max_tokens } : {}),
+    }
+
+    const response = await request(url, {
+      method: 'POST',
+      headers: {
+        ...buildAuthHeaders(apiKey, customHeadersRaw),
+        Accept: 'text/event-stream',
+      },
+      body: JSON.stringify(payload),
+      signal,
+    })
+
+    if (!response.body) {
+      throw new ApiError('protocol', '')
+    }
+
+    let thinkingIndex: number | null = null
+    let textIndex: number | null = null
+    let receivedTextDelta = false
+    const functionCalls = new Map<string, { callId: string; name: string; arguments: string }>()
+
+    for await (const { event: eventName, data } of readServerSentEvents(response.body, signal)) {
+      const trimmed = data.trim()
+      if (!trimmed || trimmed === '[DONE]') {
+        if (trimmed === '[DONE]') {
+          break
+        }
+        continue
+      }
+      let chunk: unknown
+      try {
+        chunk = JSON.parse(trimmed)
+      } catch {
+        continue
+      }
+      if (typeof chunk !== 'object' || chunk === null) {
+        continue
+      }
+      const obj = chunk as Record<string, unknown>
+      const type = typeof obj.type === 'string' ? obj.type : eventName
+
+      if (type === 'error' || type === 'response.failed') {
+        const errObj =
+          (obj.error as Record<string, unknown> | undefined) ??
+          ((obj.response as Record<string, unknown> | undefined)?.error as
+            | Record<string, unknown>
+            | undefined)
+        const msg = typeof errObj?.message === 'string' ? errObj.message : 'Responses API error'
+        throw new ApiError('stream', msg)
+      }
+
+      if (type === 'response.output_item.added' || type === 'response.output_item.done') {
+        const item =
+          typeof obj.item === 'object' && obj.item !== null
+            ? (obj.item as Record<string, unknown>)
+            : undefined
+        if (item?.type === 'function_call') {
+          const itemKey =
+            (typeof item.id === 'string' && item.id) ||
+            (typeof item.call_id === 'string' && item.call_id) ||
+            `fc_${round}_${functionCalls.size}`
+          const existing = functionCalls.get(itemKey) ?? {
+            callId: typeof item.call_id === 'string' && item.call_id ? item.call_id : itemKey,
+            name: '',
+            arguments: '',
+          }
+          if (typeof item.call_id === 'string' && item.call_id) {
+            existing.callId = item.call_id
+          }
+          if (typeof item.name === 'string' && item.name) {
+            existing.name = item.name
+          }
+          if (typeof item.arguments === 'string' && item.arguments) {
+            existing.arguments = item.arguments
+          }
+          functionCalls.set(itemKey, existing)
+        }
+        continue
+      }
+
+      if (type === 'response.function_call_arguments.delta') {
+        const itemKey = typeof obj.item_id === 'string' ? obj.item_id : ''
+        const delta = typeof obj.delta === 'string' ? obj.delta : ''
+        if (itemKey && delta) {
+          const existing = functionCalls.get(itemKey) ?? {
+            callId: itemKey,
+            name: 'web_search',
+            arguments: '',
+          }
+          existing.arguments += delta
+          functionCalls.set(itemKey, existing)
+        }
+        continue
+      }
+
+      if (
+        type === 'response.reasoning_summary_text.delta' ||
+        type === 'response.reasoning_text.delta'
+      ) {
+        const delta = typeof obj.delta === 'string' ? obj.delta : ''
+        if (delta) {
+          yield* ensureStart()
+          if (thinkingIndex === null) {
+            thinkingIndex = nextBlockIndex++
+            yield {
+              type: 'content_block_start',
+              index: thinkingIndex,
+              content_block: { type: 'thinking', thinking: '', signature: '' },
+            }
+          }
+          yield {
+            type: 'content_block_delta',
+            index: thinkingIndex,
+            delta: { type: 'thinking_delta', thinking: delta },
+          }
+        }
+        continue
+      }
+
+      if (type === 'response.output_text.delta') {
+        const delta = typeof obj.delta === 'string' ? obj.delta : ''
+        if (delta) {
+          receivedTextDelta = true
+          yield* ensureStart()
+          if (thinkingIndex !== null && textIndex === null) {
+            yield { type: 'content_block_stop', index: thinkingIndex }
+            thinkingIndex = null
+          }
+          if (textIndex === null) {
+            textIndex = nextBlockIndex++
+            yield {
+              type: 'content_block_start',
+              index: textIndex,
+              content_block: { type: 'text', text: '' },
+            }
+          }
+          yield {
+            type: 'content_block_delta',
+            index: textIndex,
+            delta: { type: 'text_delta', text: delta },
+          }
+        }
+        continue
+      }
+
+      if (type === 'response.output_text.done' && !receivedTextDelta) {
+        const full = typeof obj.text === 'string' ? obj.text : ''
+        if (full) {
+          yield* ensureStart()
+          if (textIndex === null) {
+            textIndex = nextBlockIndex++
+            yield {
+              type: 'content_block_start',
+              index: textIndex,
+              content_block: { type: 'text', text: '' },
+            }
+          }
+          yield {
+            type: 'content_block_delta',
+            index: textIndex,
+            delta: { type: 'text_delta', text: full },
+          }
+        }
+        continue
+      }
+
+      if (type === 'response.completed' || type === 'response.incomplete') {
+        const respObj = obj.response as Record<string, unknown> | undefined
+        usage = parseOpenAIUsage(respObj?.usage ?? obj.usage) ?? usage
+      }
+
+      if (type === 'response.incomplete') {
+        const reason = (
+          (obj.response as Record<string, unknown> | undefined)?.incomplete_details as
+            | Record<string, unknown>
+            | undefined
+        )?.reason
+        finishReason = mapFinishReason(reason)
+      }
+    }
+
+    if (thinkingIndex !== null) {
+      yield { type: 'content_block_stop', index: thinkingIndex }
+      thinkingIndex = null
+    }
+    if (textIndex !== null) {
+      yield { type: 'content_block_stop', index: textIndex }
+      textIndex = null
+    }
+
+    const searchCalls = [...functionCalls.values()].filter((fc) => fc.name.trim() === 'web_search')
+    if (!webSearchConfig || searchCalls.length === 0 || round >= MAX_WEB_SEARCH_ROUNDS) {
+      break
+    }
+
+    const queries = searchCalls
+      .map((fc) => parseSearchQueryArg(fc.arguments))
+      .filter((q) => q.length > 0)
+    const toolUseId = `custom_search_${Date.now()}_${round}`
+    yield* ensureStart()
+    const useBlockIndex = nextBlockIndex++
+    yield {
+      type: 'content_block_start',
+      index: useBlockIndex,
+      content_block: {
+        type: 'server_tool_use',
+        id: toolUseId,
+        name: 'deepseek_web_search',
+        input: { action: 'search', queries: queries.length > 0 ? queries : ['web search'] },
+        caller: { type: 'direct' },
+        kind: 'deep_search',
+      },
+    }
+    yield { type: 'content_block_stop', index: useBlockIndex }
+
+    const outcomes = await Promise.all(
+      searchCalls.map(async (fc) => {
+        const query = parseSearchQueryArg(fc.arguments)
+        try {
+          const res = await executeCustomWebSearch(query, webSearchConfig, signal)
+          return { call: fc, results: res.results, output: res.toolOutputText, failed: false }
+        } catch (err) {
+          signal.throwIfAborted()
+          const msg = err instanceof Error ? err.message : String(err)
+          return { call: fc, results: [] as WebSearchResult[], output: `Search error: ${msg}`, failed: true }
+        }
+      })
+    )
+
+    const mergedResults: WebSearchResult[] = []
+    const seenUrls = new Set<string>()
+    for (const outcome of outcomes) {
+      for (const item of outcome.results) {
+        if (item.url && seenUrls.has(item.url)) {
+          continue
+        }
+        if (item.url) {
+          seenUrls.add(item.url)
+        }
+        mergedResults.push(item)
+      }
+    }
+    const allFailed = outcomes.every((item) => item.failed)
+    const resultBlockIndex = nextBlockIndex++
+    yield {
+      type: 'content_block_start',
+      index: resultBlockIndex,
+      content_block: {
+        type: 'web_search_tool_result',
+        tool_use_id: toolUseId,
+        kind: 'deep_search',
+        content:
+          mergedResults.length > 0
+            ? mergedResults
+            : allFailed
+              ? [{ type: 'web_search_tool_result_error', error_code: 'unavailable' }]
+              : [],
+      },
+    }
+    yield { type: 'content_block_stop', index: resultBlockIndex }
+
+    for (const outcome of outcomes) {
+      inputItems.push(
+        {
+          type: 'function_call',
+          call_id: outcome.call.callId,
+          name: 'web_search',
+          arguments: outcome.call.arguments || '{}',
+        },
+        {
+          type: 'function_call_output',
+          call_id: outcome.call.callId,
+          output: outcome.output,
+        }
+      )
+    }
+  }
+
+  yield* ensureStart()
   yield {
     type: 'message_delta',
     delta: { stop_reason: finishReason, stop_sequence: null },

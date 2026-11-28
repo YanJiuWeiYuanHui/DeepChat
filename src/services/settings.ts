@@ -41,6 +41,34 @@ export type ImageGenChannelConfig = {
   requireConfirm: boolean
 }
 
+export type WebSearchChannelConfig = {
+  mode: ServiceChannelMode
+  endpoint: string
+  method: 'POST' | 'GET'
+  apiKey: string
+  queryParam: string
+  maxResults: number
+  customHeaders: string
+}
+
+export type ModelProfilePreset = {
+  id: string
+  name: string
+  chatProtocol: ChatProtocol
+  apiOrigin: string
+  apiKey: string
+  model: string
+  customHeaders: string
+  includeChannels?: boolean
+  asrChannel?: ServiceChannelConfig
+  ttsChannel?: TtsChannelConfig
+  visionChannel?: ServiceChannelConfig
+  ocrChannel?: ServiceChannelConfig
+  imageGenChannel?: ImageGenChannelConfig
+  webSearchChannel?: WebSearchChannelConfig
+  updatedAt: number
+}
+
 const EMPTY_CHANNEL: ServiceChannelConfig = {
   mode: 'inherit',
   baseUrl: '',
@@ -64,6 +92,16 @@ const DEFAULT_IMAGE_GEN_CHANNEL: ImageGenChannelConfig = {
   requireConfirm: true,
 }
 
+const DEFAULT_WEB_SEARCH_CHANNEL: WebSearchChannelConfig = {
+  mode: 'inherit',
+  endpoint: '',
+  method: 'POST',
+  apiKey: '',
+  queryParam: 'query',
+  maxResults: 5,
+  customHeaders: '',
+}
+
 export const DEFAULT_MODEL = 'deepseek-flash'
 export const DEFAULT_SYSTEM_PROMPT = '该助手为DeepSeek，由深度求索公司创造。'
 export const DEFAULT_VOICE_SYSTEM_PROMPT = `你是 DeepSeek（由深度求索公司创造），正在与用户进行实时语音通话，请严格使用自然口语交流：
@@ -81,6 +119,7 @@ export type Settings = {
   autoPlayVoice: boolean
   voiceAutoSend: boolean
   collapseThinking: boolean
+  autoCollapseThinking: boolean
   avatarEnabled: boolean
   avatarDataUrl: string
   avatarShape: AvatarShape
@@ -109,6 +148,9 @@ export type Settings = {
   visionChannel: ServiceChannelConfig
   ocrChannel: ServiceChannelConfig
   imageGenChannel: ImageGenChannelConfig
+  webSearchChannel: WebSearchChannelConfig
+  modelPresets: ModelProfilePreset[]
+  activeModelPresetId: string
   // 协议与工具开关
   safetyCheck: boolean
   readUrl: boolean
@@ -141,6 +183,7 @@ const KEYS = {
   autoPlayVoice: 'chat-demo:auto-play-voice',
   voiceAutoSend: 'chat-demo:voice-auto-send',
   collapseThinking: 'chat-demo:collapse-thinking',
+  autoCollapseThinking: 'chat-demo:auto-collapse-thinking',
   avatarEnabled: 'chat-demo:avatar-enabled',
   avatarDataUrl: 'chat-demo:avatar-data-url',
   avatarShape: 'chat-demo:avatar-shape',
@@ -167,6 +210,9 @@ const KEYS = {
   visionChannel: 'chat-demo:vision-channel',
   ocrChannel: 'chat-demo:ocr-channel',
   imageGenChannel: 'chat-demo:image-gen-channel',
+  webSearchChannel: 'chat-demo:web-search-channel',
+  modelPresets: 'chat-demo:model-presets',
+  activeModelPresetId: 'chat-demo:active-model-preset-id',
   safetyCheck: 'chat-demo:safety-check',
   readUrl: 'chat-demo:read-url',
   sendLatestReminder: 'chat-demo:send-latest-reminder',
@@ -264,59 +310,128 @@ const readNumber = (key: string): number | null => {
   return Number.isFinite(value) ? value : null
 }
 
-const readChannel = (key: string): ServiceChannelConfig => {
-  try {
-    const parsed: unknown = JSON.parse(read(key) ?? 'null')
-    if (typeof parsed !== 'object' || parsed === null) {
-      return { ...EMPTY_CHANNEL }
-    }
-    const obj = parsed as Record<string, unknown>
-    return {
-      mode: obj.mode === 'custom' ? 'custom' : 'inherit',
-      baseUrl: typeof obj.baseUrl === 'string' ? obj.baseUrl : '',
-      apiKey: typeof obj.apiKey === 'string' ? obj.apiKey : '',
-      model: typeof obj.model === 'string' ? obj.model : '',
-    }
-  } catch {
+const normalizeChannel = (raw: unknown): ServiceChannelConfig => {
+  if (typeof raw !== 'object' || raw === null) {
     return { ...EMPTY_CHANNEL }
   }
-}
-
-const readTtsChannel = (key: string): TtsChannelConfig => {
-  try {
-    const parsed: unknown = JSON.parse(read(key) ?? 'null')
-    if (typeof parsed !== 'object' || parsed === null) {
-      return { ...EMPTY_TTS_CHANNEL }
-    }
-    const obj = parsed as Record<string, unknown>
-    return {
-      ...readChannel(key),
-      voice: typeof obj.voice === 'string' ? obj.voice : 'alloy',
-    }
-  } catch {
-    return { ...EMPTY_TTS_CHANNEL }
+  const obj = raw as Record<string, unknown>
+  return {
+    mode: obj.mode === 'custom' ? 'custom' : 'inherit',
+    baseUrl: typeof obj.baseUrl === 'string' ? obj.baseUrl : '',
+    apiKey: typeof obj.apiKey === 'string' ? obj.apiKey : '',
+    model: typeof obj.model === 'string' ? obj.model : '',
   }
 }
 
-const readImageGenChannel = (key: string): ImageGenChannelConfig => {
-  try {
-    const parsed: unknown = JSON.parse(read(key) ?? 'null')
-    if (typeof parsed !== 'object' || parsed === null) {
-      return { ...DEFAULT_IMAGE_GEN_CHANNEL }
-    }
-    const obj = parsed as Record<string, unknown>
-    return {
-      enabled: obj.enabled === true,
-      protocol: obj.protocol === 'responses' || obj.protocol === 'images' ? obj.protocol : 'auto',
-      baseUrl: typeof obj.baseUrl === 'string' ? obj.baseUrl : '',
-      apiKey: typeof obj.apiKey === 'string' ? obj.apiKey : '',
-      model: typeof obj.model === 'string' ? obj.model : '',
-      size: typeof obj.size === 'string' && obj.size ? obj.size : 'auto',
-      customHeaders: typeof obj.customHeaders === 'string' ? obj.customHeaders : '',
-      requireConfirm: obj.requireConfirm !== false,
-    }
-  } catch {
+const normalizeTtsChannel = (raw: unknown): TtsChannelConfig => {
+  if (typeof raw !== 'object' || raw === null) {
+    return { ...EMPTY_TTS_CHANNEL }
+  }
+  const obj = raw as Record<string, unknown>
+  return {
+    ...normalizeChannel(raw),
+    voice: typeof obj.voice === 'string' ? obj.voice : 'alloy',
+  }
+}
+
+const normalizeImageGenChannel = (raw: unknown): ImageGenChannelConfig => {
+  if (typeof raw !== 'object' || raw === null) {
     return { ...DEFAULT_IMAGE_GEN_CHANNEL }
+  }
+  const obj = raw as Record<string, unknown>
+  return {
+    enabled: obj.enabled === true,
+    protocol: obj.protocol === 'responses' || obj.protocol === 'images' ? obj.protocol : 'auto',
+    baseUrl: typeof obj.baseUrl === 'string' ? obj.baseUrl : '',
+    apiKey: typeof obj.apiKey === 'string' ? obj.apiKey : '',
+    model: typeof obj.model === 'string' ? obj.model : '',
+    size: typeof obj.size === 'string' && obj.size ? obj.size : 'auto',
+    customHeaders: typeof obj.customHeaders === 'string' ? obj.customHeaders : '',
+    requireConfirm: obj.requireConfirm !== false,
+  }
+}
+
+const normalizeWebSearchChannel = (raw: unknown): WebSearchChannelConfig => {
+  if (typeof raw !== 'object' || raw === null) {
+    return { ...DEFAULT_WEB_SEARCH_CHANNEL }
+  }
+  const obj = raw as Record<string, unknown>
+  const maxRaw = typeof obj.maxResults === 'number' && Number.isFinite(obj.maxResults) ? obj.maxResults : 5
+  return {
+    mode: obj.mode === 'custom' ? 'custom' : 'inherit',
+    endpoint: typeof obj.endpoint === 'string' ? obj.endpoint : '',
+    method: obj.method === 'GET' ? 'GET' : 'POST',
+    apiKey: typeof obj.apiKey === 'string' ? obj.apiKey : '',
+    queryParam: typeof obj.queryParam === 'string' && obj.queryParam.trim() ? obj.queryParam.trim() : 'query',
+    maxResults: Math.min(20, Math.max(1, Math.round(maxRaw))),
+    customHeaders: typeof obj.customHeaders === 'string' ? obj.customHeaders : '',
+  }
+}
+
+const normalizeChatProtocol = (value: unknown): ChatProtocol =>
+  value === 'openai' || value === 'responses' || value === 'local' ? value : 'deepseek'
+
+const normalizePreset = (raw: unknown): ModelProfilePreset | null => {
+  if (typeof raw !== 'object' || raw === null) {
+    return null
+  }
+  const obj = raw as Record<string, unknown>
+  const name = typeof obj.name === 'string' ? obj.name.trim() : ''
+  if (!name) {
+    return null
+  }
+  const id =
+    typeof obj.id === 'string' && obj.id.trim()
+      ? obj.id.trim()
+      : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
+  const includeChannels = obj.includeChannels === true
+  return {
+    id,
+    name,
+    chatProtocol: normalizeChatProtocol(obj.chatProtocol),
+    apiOrigin: typeof obj.apiOrigin === 'string' ? obj.apiOrigin : '',
+    apiKey: typeof obj.apiKey === 'string' ? obj.apiKey : '',
+    model: typeof obj.model === 'string' ? obj.model : '',
+    customHeaders: typeof obj.customHeaders === 'string' ? obj.customHeaders : '',
+    includeChannels,
+    ...(includeChannels
+      ? {
+          asrChannel: normalizeChannel(obj.asrChannel),
+          ttsChannel: normalizeTtsChannel(obj.ttsChannel),
+          visionChannel: normalizeChannel(obj.visionChannel),
+          ocrChannel: normalizeChannel(obj.ocrChannel),
+          imageGenChannel: normalizeImageGenChannel(obj.imageGenChannel),
+          webSearchChannel: normalizeWebSearchChannel(obj.webSearchChannel),
+        }
+      : {}),
+    updatedAt: typeof obj.updatedAt === 'number' && Number.isFinite(obj.updatedAt) ? obj.updatedAt : Date.now(),
+  }
+}
+
+const parseJsonKey = <T>(key: string, convert: (raw: unknown) => T): T => {
+  try {
+    return convert(JSON.parse(read(key) ?? 'null'))
+  } catch {
+    return convert(null)
+  }
+}
+
+const readChannel = (key: string): ServiceChannelConfig => parseJsonKey(key, normalizeChannel)
+const readTtsChannel = (key: string): TtsChannelConfig => parseJsonKey(key, normalizeTtsChannel)
+const readImageGenChannel = (key: string): ImageGenChannelConfig =>
+  parseJsonKey(key, normalizeImageGenChannel)
+const readWebSearchChannel = (key: string): WebSearchChannelConfig =>
+  parseJsonKey(key, normalizeWebSearchChannel)
+
+const readModelPresets = (): ModelProfilePreset[] => {
+  try {
+    const parsed: unknown = JSON.parse(read(KEYS.modelPresets) ?? '[]')
+    if (!Array.isArray(parsed)) {
+      return []
+    }
+    return parsed.map(normalizePreset).filter((item): item is ModelProfilePreset => item !== null)
+  } catch {
+    return []
   }
 }
 
@@ -356,6 +471,7 @@ export const useSettings = create<Settings>(() => ({
   autoPlayVoice: readBool(KEYS.autoPlayVoice, false),
   voiceAutoSend: readBool(KEYS.voiceAutoSend, true),
   collapseThinking: readBool(KEYS.collapseThinking, false),
+  autoCollapseThinking: readBool(KEYS.autoCollapseThinking, true),
   avatarEnabled: readBool(KEYS.avatarEnabled, false),
   avatarDataUrl: read(KEYS.avatarDataUrl) ?? '',
   avatarShape: read(KEYS.avatarShape) === 'square' ? 'square' : 'circle',
@@ -382,6 +498,9 @@ export const useSettings = create<Settings>(() => ({
   visionChannel: readChannel(KEYS.visionChannel),
   ocrChannel: readChannel(KEYS.ocrChannel),
   imageGenChannel: readImageGenChannel(KEYS.imageGenChannel),
+  webSearchChannel: readWebSearchChannel(KEYS.webSearchChannel),
+  modelPresets: readModelPresets(),
+  activeModelPresetId: read(KEYS.activeModelPresetId) ?? '',
   safetyCheck: readBool(KEYS.safetyCheck, true),
   readUrl: readBool(KEYS.readUrl, true),
   sendLatestReminder: readBool(KEYS.sendLatestReminder, true),
@@ -431,6 +550,9 @@ export const setVoiceAutoSend = (value: boolean) =>
 
 export const setCollapseThinking = (value: boolean) =>
   setBoolSetting(KEYS.collapseThinking, 'collapseThinking', value)
+
+export const setAutoCollapseThinking = (value: boolean) =>
+  setBoolSetting(KEYS.autoCollapseThinking, 'autoCollapseThinking', value)
 
 export const setAvatarEnabled = (value: boolean) =>
   setBoolSetting(KEYS.avatarEnabled, 'avatarEnabled', value)
@@ -521,6 +643,12 @@ export const setOcrChannel = (ocrChannel: ServiceChannelConfig) => {
 export const setImageGenChannel = (imageGenChannel: ImageGenChannelConfig) => {
   write(KEYS.imageGenChannel, JSON.stringify(imageGenChannel))
   useSettings.setState({ imageGenChannel })
+}
+
+export const setWebSearchChannel = (webSearchChannel: WebSearchChannelConfig) => {
+  const normalized = normalizeWebSearchChannel(webSearchChannel)
+  write(KEYS.webSearchChannel, JSON.stringify(normalized))
+  useSettings.setState({ webSearchChannel: normalized })
 }
 
 export const setApiOrigin = (apiOrigin: string) => {
@@ -645,8 +773,148 @@ export const setRefusalMessage = (refusalMessage: string) => {
   useSettings.setState({ refusalMessage })
 }
 
+const writeModelPresets = (modelPresets: ModelProfilePreset[], activeModelPresetId?: string) => {
+  write(KEYS.modelPresets, modelPresets.length > 0 ? JSON.stringify(modelPresets) : null)
+  if (activeModelPresetId !== undefined) {
+    write(KEYS.activeModelPresetId, activeModelPresetId || null)
+    useSettings.setState({ modelPresets, activeModelPresetId })
+  } else {
+    useSettings.setState({ modelPresets })
+  }
+}
+
+export const saveModelPreset = (
+  name: string,
+  options: { includeChannels?: boolean; overwriteId?: string } = {}
+): ModelProfilePreset => {
+  const state = useSettings.getState()
+  const id =
+    options.overwriteId?.trim() ||
+    `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
+  const includeChannels = options.includeChannels === true
+  const preset: ModelProfilePreset = {
+    id,
+    name: name.trim(),
+    chatProtocol: state.chatProtocol,
+    apiOrigin: state.apiOrigin,
+    apiKey: state.apiKey ?? '',
+    model: state.model,
+    customHeaders: state.customHeaders,
+    includeChannels,
+    ...(includeChannels
+      ? {
+          asrChannel: { ...state.asrChannel },
+          ttsChannel: { ...state.ttsChannel },
+          visionChannel: { ...state.visionChannel },
+          ocrChannel: { ...state.ocrChannel },
+          imageGenChannel: { ...state.imageGenChannel },
+          webSearchChannel: { ...state.webSearchChannel },
+        }
+      : {}),
+    updatedAt: Date.now(),
+  }
+  const existingIndex = state.modelPresets.findIndex((item) => item.id === id)
+  const next =
+    existingIndex >= 0
+      ? state.modelPresets.map((item, idx) => (idx === existingIndex ? preset : item))
+      : [preset, ...state.modelPresets]
+  writeModelPresets(next, id)
+  return preset
+}
+
+export const applyModelPreset = (id: string): boolean => {
+  const preset = useSettings.getState().modelPresets.find((item) => item.id === id)
+  if (!preset) {
+    return false
+  }
+  setChatProtocol(preset.chatProtocol)
+  setApiOrigin(preset.apiOrigin)
+  setApiKey(preset.apiKey || null)
+  setModel(preset.model)
+  setCustomHeaders(preset.customHeaders)
+  if (preset.includeChannels) {
+    if (preset.asrChannel) {
+      setAsrChannel({ ...preset.asrChannel })
+    }
+    if (preset.ttsChannel) {
+      setTtsChannel({ ...preset.ttsChannel })
+    }
+    if (preset.visionChannel) {
+      setVisionChannel({ ...preset.visionChannel })
+    }
+    if (preset.ocrChannel) {
+      setOcrChannel({ ...preset.ocrChannel })
+    }
+    if (preset.imageGenChannel) {
+      setImageGenChannel({ ...preset.imageGenChannel })
+    }
+    if (preset.webSearchChannel) {
+      setWebSearchChannel({ ...preset.webSearchChannel })
+    }
+  }
+  write(KEYS.activeModelPresetId, preset.id)
+  useSettings.setState({ activeModelPresetId: preset.id })
+  return true
+}
+
+export const renameModelPreset = (id: string, name: string) => {
+  const trimmed = name.trim()
+  if (!trimmed) {
+    return
+  }
+  const next = useSettings
+    .getState()
+    .modelPresets.map((item) =>
+      item.id === id ? { ...item, name: trimmed, updatedAt: Date.now() } : item
+    )
+  writeModelPresets(next)
+}
+
+export const deleteModelPreset = (id: string) => {
+  const state = useSettings.getState()
+  const next = state.modelPresets.filter((item) => item.id !== id)
+  const nextActive = state.activeModelPresetId === id ? '' : undefined
+  writeModelPresets(next, nextActive)
+}
+
+export const exportModelPresetsJson = (): string =>
+  JSON.stringify(
+    {
+      version: 1,
+      presets: useSettings.getState().modelPresets,
+    },
+    null,
+    2
+  )
+
+export const importModelPresetsJson = (raw: string): number => {
+  const parsed: unknown = JSON.parse(raw)
+  const list = Array.isArray(parsed)
+    ? parsed
+    : typeof parsed === 'object' && parsed !== null && Array.isArray((parsed as { presets?: unknown }).presets)
+      ? (parsed as { presets: unknown[] }).presets
+      : null
+  if (!list) {
+    throw new Error('Invalid preset JSON')
+  }
+  const incoming = list
+    .map(normalizePreset)
+    .filter((item): item is ModelProfilePreset => item !== null)
+  if (incoming.length === 0) {
+    return 0
+  }
+  const byId = new Map(useSettings.getState().modelPresets.map((item) => [item.id, item]))
+  for (const preset of incoming) {
+    byId.set(preset.id, preset)
+  }
+  writeModelPresets([...byId.values()])
+  return incoming.length
+}
+
 export const resetModelAndPolicySettings = () => {
   setChatProtocol('deepseek')
+  write(KEYS.activeModelPresetId, null)
+  useSettings.setState({ activeModelPresetId: '' })
   setApiOrigin('')
   setCustomHeaders('')
   setModel(DEFAULT_MODEL)
@@ -660,6 +928,7 @@ export const resetModelAndPolicySettings = () => {
   setVisionChannel({ ...EMPTY_CHANNEL })
   setOcrChannel({ ...EMPTY_CHANNEL })
   setImageGenChannel({ ...DEFAULT_IMAGE_GEN_CHANNEL })
+  setWebSearchChannel({ ...DEFAULT_WEB_SEARCH_CHANNEL })
   setImageGen(false)
   setSafetyCheck(true)
   setReadUrl(true)

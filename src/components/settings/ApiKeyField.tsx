@@ -12,7 +12,11 @@ export const useApiKeyEditor = () => {
   const apiKey = useSettings((state) => state.apiKey)
   const [editing, setEditing] = useState(false)
   const form = useApiKeyForm(() => setEditing(false))
-  return { apiKey, editing, setEditing, form, showInput: !apiKey || editing }
+  const reset = () => {
+    setEditing(false)
+    form.reset()
+  }
+  return { apiKey, editing, setEditing, form, reset, showInput: !apiKey || editing }
 }
 
 type ApiKeyEditor = ReturnType<typeof useApiKeyEditor>

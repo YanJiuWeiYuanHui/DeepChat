@@ -14,6 +14,8 @@ import android.os.Bundle;
 import android.os.Environment;
 import android.provider.MediaStore;
 import android.provider.Settings;
+import android.system.Os;
+import android.system.OsConstants;
 import android.webkit.JavascriptInterface;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
@@ -41,8 +43,10 @@ import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.SecureRandom;
+import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Date;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
@@ -54,15 +58,23 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.zip.Deflater;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipOutputStream;
 
 public class MainActivity extends BridgeActivity {
 
     private static final int MAX_LINE_BYTES = 16 * 1024;
     private static final int MAX_HEADERS = 128;
     private static final int MAX_PROXY_BODY_BYTES = 32 * 1024 * 1024;
+    private static final int MAX_BACKUP_SESSION_BYTES = 64 * 1024 * 1024;
     private static final long MAX_SAVE_FILE_BYTES = 256L * 1024 * 1024;
     private static final String STATE_PENDING_SAVE_FILE = "pending_save_file";
     private static final String STATE_PENDING_SAVE_NAME = "pending_save_name";
+    private static final String STATE_PENDING_CAMERA_FILE = "pending_camera_file";
+
+    private final Object backupLock = new Object();
+    private final Object saveFileLock = new Object();
 
     private static final Set<String> HOP_BY_HOP = new HashSet<>(Arrays.asList(
         "host",
@@ -95,6 +107,8 @@ public class MainActivity extends BridgeActivity {
     private volatile File pendingSaveFile = null;
     private volatile String pendingSaveFileName = "";
     private volatile File pendingCameraFile = null;
+    private volatile String pendingReadyPhotoId = null;
+    private volatile String pendingReadyPhotoName = null;
     private ActivityResultLauncher<Intent> saveFileLauncher;
     private ActivityResultLauncher<Intent> cameraCaptureLauncher;
     private ActivityResultLauncher<String> cameraPermissionLauncher;
@@ -180,6 +194,18 @@ public class MainActivity extends BridgeActivity {
                 return true;
             }
             return launchNativeCamera();
+        }
+
+        @JavascriptInterface
+        public String consumePendingNativePhoto() {
+            String id = pendingReadyPhotoId;
+            String name = pendingReadyPhotoName;
+            pendingReadyPhotoId = null;
+            pendingReadyPhotoName = null;
+            if (id == null || id.isEmpty() || !capturedPhotos.containsKey(id)) {
+                return "";
+            }
+            return "{\"id\":\"" + escapeJson(id) + "\",\"name\":\"" + escapeJson(name != null ? name : "photo.jpg") + "\"}";
         }
 
         @JavascriptInterface
@@ -351,6 +377,7 @@ public class MainActivity extends BridgeActivity {
             Uri photoUri = FileProvider.getUriForFile(this, getPackageName() + ".fileprovider", photoFile);
             Intent intent = new Intent(MediaStore.ACTION_IMAGE_CAPTURE);
             intent.putExtra(MediaStore.EXTRA_OUTPUT, photoUri);
+            intent.setClipData(android.content.ClipData.newRawUri("", photoUri));
             intent.addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION | Intent.FLAG_GRANT_READ_URI_PERMISSION);
             pendingCameraFile = photoFile;
             runOnUiThread(() -> {
@@ -424,10 +451,19 @@ public class MainActivity extends BridgeActivity {
     @Override
     public void onSaveInstanceState(Bundle outState) {
         super.onSaveInstanceState(outState);
-        File pending = pendingSaveFile;
+        final File pending;
+        final String name;
+        synchronized (saveFileLock) {
+            pending = pendingSaveFile;
+            name = pendingSaveFileName;
+        }
         if (pending != null) {
             outState.putString(STATE_PENDING_SAVE_FILE, pending.getAbsolutePath());
-            outState.putString(STATE_PENDING_SAVE_NAME, pendingSaveFileName);
+            outState.putString(STATE_PENDING_SAVE_NAME, name);
+        }
+        File camFile = pendingCameraFile;
+        if (camFile != null) {
+            outState.putString(STATE_PENDING_CAMERA_FILE, camFile.getAbsolutePath());
         }
     }
 
@@ -436,8 +472,14 @@ public class MainActivity extends BridgeActivity {
         if (savedInstanceState != null) {
             String path = savedInstanceState.getString(STATE_PENDING_SAVE_FILE);
             if (path != null) {
-                pendingSaveFile = new File(path);
-                pendingSaveFileName = savedInstanceState.getString(STATE_PENDING_SAVE_NAME, "");
+                synchronized (saveFileLock) {
+                    pendingSaveFile = new File(path);
+                    pendingSaveFileName = savedInstanceState.getString(STATE_PENDING_SAVE_NAME, "");
+                }
+            }
+            String camPath = savedInstanceState.getString(STATE_PENDING_CAMERA_FILE);
+            if (camPath != null && !camPath.isEmpty()) {
+                pendingCameraFile = new File(camPath);
             }
         }
         cameraPermissionLauncher = registerForActivityResult(
@@ -457,30 +499,51 @@ public class MainActivity extends BridgeActivity {
         cameraCaptureLauncher = registerForActivityResult(
             new ActivityResultContracts.StartActivityForResult(),
             result -> {
-                final File photoFile = pendingCameraFile;
-                pendingCameraFile = null;
-                if (result.getResultCode() == Activity.RESULT_OK && photoFile != null && photoFile.exists() && photoFile.length() > 0) {
-                    String id = UUID.randomUUID().toString();
-                    capturedPhotos.put(id, photoFile);
-                    WebView webView = getBridge() != null ? getBridge().getWebView() : null;
-                    if (webView != null && !isFinishing() && !isDestroyed()) {
-                        String js = "window.__deepchatOnNativePhoto && window.__deepchatOnNativePhoto(\""
-                            + escapeJson(id) + "\",\"" + escapeJson(photoFile.getName()) + "\");";
-                        webView.evaluateJavascript(js, null);
+                try {
+                    final File photoFile = pendingCameraFile;
+                    pendingCameraFile = null;
+                    if (result != null
+                        && result.getResultCode() == Activity.RESULT_OK
+                        && photoFile != null
+                        && photoFile.exists()
+                        && photoFile.length() > 0) {
+                        final String id = UUID.randomUUID().toString();
+                        final String fileName = photoFile.getName();
+                        capturedPhotos.put(id, photoFile);
+                        pendingReadyPhotoId = id;
+                        pendingReadyPhotoName = fileName;
+                        runOnUiThread(() -> {
+                            try {
+                                WebView webView = getBridge() != null ? getBridge().getWebView() : null;
+                                if (webView != null && !isFinishing() && !isDestroyed()) {
+                                    String js = "window.__deepchatOnNativePhoto && window.__deepchatOnNativePhoto(\""
+                                        + escapeJson(id) + "\",\"" + escapeJson(fileName) + "\");";
+                                    webView.evaluateJavascript(js, null);
+                                }
+                            } catch (Throwable ignored) {
+                                // 若 Activity 刚重建 WebView 尚未挂载，前端启动后会通过 consumePendingNativePhoto() 拉取
+                            }
+                        });
+                    } else if (photoFile != null && photoFile.exists()) {
+                        //noinspection ResultOfMethodCallIgnored
+                        photoFile.delete();
                     }
-                } else if (photoFile != null && photoFile.exists()) {
-                    //noinspection ResultOfMethodCallIgnored
-                    photoFile.delete();
+                } catch (Throwable ignored) {
+                    // 防止相机返回时因低内存重建或 OEM 异常导致闪退
                 }
             }
         );
         saveFileLauncher = registerForActivityResult(
             new ActivityResultContracts.StartActivityForResult(),
             result -> {
-                final File src = pendingSaveFile;
-                final String name = pendingSaveFileName;
-                pendingSaveFile = null;
-                pendingSaveFileName = "";
+                final File src;
+                final String name;
+                synchronized (saveFileLock) {
+                    src = pendingSaveFile;
+                    name = pendingSaveFileName;
+                    pendingSaveFile = null;
+                    pendingSaveFileName = "";
+                }
                 if (result.getResultCode() == Activity.RESULT_OK
                     && result.getData() != null
                     && result.getData().getData() != null
@@ -577,17 +640,19 @@ public class MainActivity extends BridgeActivity {
     @Override
     public void onDestroy() {
         stopLocalProxy();
-        for (File photo : capturedPhotos.values()) {
-            if (photo != null && photo.exists()) {
-                //noinspection ResultOfMethodCallIgnored
-                photo.delete();
+        if (isFinishing()) {
+            for (File photo : capturedPhotos.values()) {
+                if (photo != null && photo.exists()) {
+                    //noinspection ResultOfMethodCallIgnored
+                    photo.delete();
+                }
             }
-        }
-        capturedPhotos.clear();
-        if (pendingCameraFile != null && pendingCameraFile.exists()) {
-            //noinspection ResultOfMethodCallIgnored
-            pendingCameraFile.delete();
-            pendingCameraFile = null;
+            capturedPhotos.clear();
+            if (pendingCameraFile != null && pendingCameraFile.exists()) {
+                //noinspection ResultOfMethodCallIgnored
+                pendingCameraFile.delete();
+                pendingCameraFile = null;
+            }
         }
         super.onDestroy();
     }
@@ -775,12 +840,26 @@ public class MainActivity extends BridgeActivity {
                 return;
             }
 
+            if (requestPath.startsWith("/__deepchat_backup/")) {
+                handleBackupRequest(method, requestPath, contentLength, isChunked, in, out, corsOrigin);
+                return;
+            }
+
             if ("POST".equals(method) && requestPath.startsWith("/__deepchat_save_file")) {
                 if (contentLength > MAX_SAVE_FILE_BYTES) {
                     sendJsonError(out, 413, "File too large", corsOrigin);
                     return;
                 }
                 handleSaveFileRequest(requestPath, contentLength, in, out, corsOrigin);
+                return;
+            }
+
+            if ("POST".equals(method) && requestPath.startsWith("/__deepchat_share_image")) {
+                if (contentLength > 64L * 1024 * 1024) {
+                    sendJsonError(out, 413, "Image too large", corsOrigin);
+                    return;
+                }
+                handleShareImageRequest(requestPath, contentLength, in, out, corsOrigin);
                 return;
             }
 
@@ -1060,21 +1139,134 @@ public class MainActivity extends BridgeActivity {
             exportDir.mkdirs();
         }
         File tempFile = new File(exportDir, System.currentTimeMillis() + "_" + safeName);
+        boolean handedOff = false;
+        try {
+            byte[] buf = new byte[16384];
+            long remaining = contentLength;
+            try (FileOutputStream fos = new FileOutputStream(tempFile)) {
+                while (remaining > 0L) {
+                    int toRead = (int) Math.min(buf.length, remaining);
+                    int read = in.read(buf, 0, toRead);
+                    if (read < 0) {
+                        throw new IOException("Unexpected EOF in save file body");
+                    }
+                    fos.write(buf, 0, read);
+                    remaining -= read;
+                }
+                fos.flush();
+            }
+
+            saveTempFileToDownloads(tempFile, safeName, mimeType, out, corsOrigin);
+            handedOff = true;
+        } finally {
+            boolean ownedByPicker;
+            synchronized (saveFileLock) {
+                ownedByPicker = pendingSaveFile == tempFile;
+            }
+            if (!handedOff && !ownedByPicker && tempFile.exists()) {
+                //noinspection ResultOfMethodCallIgnored
+                tempFile.delete();
+            }
+        }
+    }
+
+    private void handleShareImageRequest(
+        String requestPath,
+        long contentLength,
+        BufferedInputStream in,
+        OutputStream out,
+        String corsOrigin
+    ) throws IOException {
+        String fileName = "deepchat-share.jpg";
+        String mimeType = "image/jpeg";
+        int qIndex = requestPath.indexOf('?');
+        if (qIndex >= 0) {
+            String query = requestPath.substring(qIndex + 1);
+            for (String pair : query.split("&")) {
+                int eq = pair.indexOf('=');
+                if (eq > 0) {
+                    String key = URLDecoder.decode(pair.substring(0, eq), "UTF-8");
+                    String val = URLDecoder.decode(pair.substring(eq + 1), "UTF-8");
+                    if ("name".equals(key) && !val.trim().isEmpty()) {
+                        fileName = val.trim();
+                    } else if ("mime".equals(key) && !val.trim().isEmpty()) {
+                        mimeType = val.trim();
+                    }
+                }
+            }
+        }
+        String safeName = fileName.replaceAll("[\\\\/:*?\"<>|\\x00-\\x1F]", "_");
+        String lowerName = safeName.toLowerCase(Locale.ROOT);
+        if (!lowerName.endsWith(".jpg") && !lowerName.endsWith(".jpeg") && !lowerName.endsWith(".png")) {
+            safeName = safeName + ("image/png".equalsIgnoreCase(mimeType) ? ".png" : ".jpg");
+        }
+        File shareDir = new File(getCacheDir(), "share");
+        if (!shareDir.exists()) {
+            //noinspection ResultOfMethodCallIgnored
+            shareDir.mkdirs();
+        }
+        File[] oldFiles = shareDir.listFiles();
+        if (oldFiles != null && oldFiles.length > 5) {
+            Arrays.sort(oldFiles, (a, b) -> Long.compare(a.lastModified(), b.lastModified()));
+            for (int i = 0; i < oldFiles.length - 5; i++) {
+                //noinspection ResultOfMethodCallIgnored
+                oldFiles[i].delete();
+            }
+        }
+        File shareFile = new File(shareDir, System.currentTimeMillis() + "_" + safeName);
         byte[] buf = new byte[16384];
         long remaining = contentLength;
-        try (FileOutputStream fos = new FileOutputStream(tempFile)) {
+        try (FileOutputStream fos = new FileOutputStream(shareFile)) {
             while (remaining > 0L) {
                 int toRead = (int) Math.min(buf.length, remaining);
                 int read = in.read(buf, 0, toRead);
                 if (read < 0) {
-                    break;
+                    throw new IOException("Unexpected EOF in share image body");
                 }
                 fos.write(buf, 0, read);
                 remaining -= read;
             }
             fos.flush();
         }
+        try {
+            Uri shareUri = FileProvider.getUriForFile(this, getPackageName() + ".fileprovider", shareFile);
+            Intent shareIntent = new Intent(Intent.ACTION_SEND);
+            shareIntent.setType(mimeType);
+            shareIntent.putExtra(Intent.EXTRA_STREAM, shareUri);
+            shareIntent.setClipData(android.content.ClipData.newRawUri("", shareUri));
+            shareIntent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+            Intent chooser = Intent.createChooser(
+                shareIntent,
+                isZhLocale() ? "分享对话图片" : "Share chat image"
+            );
+            runOnUiThread(() -> {
+                try {
+                    if (!isFinishing() && !isDestroyed()) {
+                        startActivity(chooser);
+                    }
+                } catch (Throwable ignored) {
+                    Toast.makeText(
+                        this,
+                        isZhLocale() ? "未找到可分享的应用" : "No share target available",
+                        Toast.LENGTH_SHORT
+                    ).show();
+                }
+            });
+            sendJsonOk(out, "{\"ok\":true}", corsOrigin);
+        } catch (Exception e) {
+            sendJsonError(out, 500, "Failed to share image: " + e.getMessage(), corsOrigin);
+        }
+    }
 
+    private void saveTempFileToDownloads(
+        File tempFile,
+        String safeName,
+        String mimeType,
+        OutputStream out,
+        String corsOrigin
+    ) throws IOException {
+        long fileBytes = tempFile.length();
+        byte[] buf = new byte[16384];
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             Uri insertedUri = null;
             ContentResolver resolver = getContentResolver();
@@ -1112,7 +1304,15 @@ public class MainActivity extends BridgeActivity {
                             Toast.makeText(this, msg, Toast.LENGTH_LONG).show();
                         }
                     });
-                    sendJsonOk(out, "{\"ok\":true,\"mode\":\"android\"}", corsOrigin);
+                    sendJsonOk(
+                        out,
+                        "{\"ok\":true,\"mode\":\"android\",\"fileName\":\""
+                            + escapeJson(safeName)
+                            + "\",\"bytes\":"
+                            + fileBytes
+                            + "}",
+                        corsOrigin
+                    );
                     return;
                 }
             } catch (Exception ignored) {
@@ -1127,12 +1327,14 @@ public class MainActivity extends BridgeActivity {
             }
         }
 
-        if (pendingSaveFile != null && pendingSaveFile.exists()) {
-            //noinspection ResultOfMethodCallIgnored
-            pendingSaveFile.delete();
+        synchronized (saveFileLock) {
+            if (pendingSaveFile != null && pendingSaveFile.exists()) {
+                //noinspection ResultOfMethodCallIgnored
+                pendingSaveFile.delete();
+            }
+            pendingSaveFile = tempFile;
+            pendingSaveFileName = safeName;
         }
-        pendingSaveFile = tempFile;
-        pendingSaveFileName = safeName;
         final String finalMime = mimeType;
         runOnUiThread(() -> {
             if (!isFinishing() && !isDestroyed()) {
@@ -1141,9 +1343,539 @@ public class MainActivity extends BridgeActivity {
                 intent.setType(finalMime);
                 intent.putExtra(Intent.EXTRA_TITLE, safeName);
                 saveFileLauncher.launch(intent);
+            } else {
+                synchronized (saveFileLock) {
+                    if (pendingSaveFile == tempFile) {
+                        pendingSaveFile = null;
+                        pendingSaveFileName = "";
+                    }
+                }
+                if (tempFile.exists()) {
+                    //noinspection ResultOfMethodCallIgnored
+                    tempFile.delete();
+                }
             }
         });
-        sendJsonOk(out, "{\"ok\":true,\"mode\":\"picker\"}", corsOrigin);
+        sendJsonOk(
+            out,
+            "{\"ok\":true,\"mode\":\"picker\",\"fileName\":\""
+                + escapeJson(safeName)
+                + "\",\"bytes\":"
+                + fileBytes
+                + "}",
+            corsOrigin
+        );
+    }
+
+    private static String getQueryParam(String requestPath, String targetKey) {
+        int qIndex = requestPath.indexOf('?');
+        if (qIndex < 0) {
+            return null;
+        }
+        String query = requestPath.substring(qIndex + 1);
+        for (String pair : query.split("&")) {
+            int eq = pair.indexOf('=');
+            if (eq > 0) {
+                try {
+                    String key = URLDecoder.decode(pair.substring(0, eq), "UTF-8");
+                    if (targetKey.equals(key)) {
+                        return URLDecoder.decode(pair.substring(eq + 1), "UTF-8");
+                    }
+                } catch (Exception ignored) {
+                    // ignore malformed query encoding
+                }
+            }
+        }
+        return null;
+    }
+
+    private static String stripQuery(String requestPath) {
+        int qIndex = requestPath.indexOf('?');
+        return qIndex >= 0 ? requestPath.substring(0, qIndex) : requestPath;
+    }
+
+    private static String sanitizeBackupSessionId(String raw) {
+        if (raw == null || raw.isEmpty() || raw.length() > 128) {
+            return null;
+        }
+        for (int i = 0; i < raw.length(); i++) {
+            char c = raw.charAt(i);
+            boolean ok = (c >= 'a' && c <= 'z')
+                || (c >= 'A' && c <= 'Z')
+                || (c >= '0' && c <= '9')
+                || c == '-'
+                || c == '_';
+            if (!ok) {
+                return null;
+            }
+        }
+        return raw;
+    }
+
+    private File getBackupDir() {
+        File dir = new File(getFilesDir(), "chat_backup");
+        if (!dir.exists()) {
+            //noinspection ResultOfMethodCallIgnored
+            dir.mkdirs();
+        }
+        return dir;
+    }
+
+    private static boolean isSymbolicLink(File file) {
+        if (file == null) {
+            return false;
+        }
+        try {
+            return OsConstants.S_ISLNK(Os.lstat(file.getPath()).st_mode);
+        } catch (Exception ignored) {
+            return false;
+        }
+    }
+
+    private static void measureDirStats(File target, int depth, long[] outBytesAndFiles) {
+        if (target == null || depth > 14 || !target.exists() || isSymbolicLink(target)) {
+            return;
+        }
+        if (target.isFile()) {
+            outBytesAndFiles[0] += Math.max(0L, target.length());
+            outBytesAndFiles[1] += 1L;
+            return;
+        }
+        File[] children = target.listFiles();
+        if (children == null) {
+            return;
+        }
+        for (File child : children) {
+            measureDirStats(child, depth + 1, outBytesAndFiles);
+        }
+    }
+
+    private static void collectIndexedDbRoots(File dir, String relPrefix, int depth, List<File> outDirs, List<String> outNames) {
+        if (dir == null || depth > 5 || !dir.isDirectory() || isSymbolicLink(dir)) {
+            return;
+        }
+        String name = dir.getName();
+        String rel = relPrefix.isEmpty() ? name : relPrefix + "/" + name;
+        if ("IndexedDB".equals(name)) {
+            outDirs.add(dir);
+            outNames.add(rel);
+            return;
+        }
+        File[] children = dir.listFiles();
+        if (children == null) {
+            return;
+        }
+        for (File child : children) {
+            if (child.isDirectory()) {
+                collectIndexedDbRoots(child, rel, depth + 1, outDirs, outNames);
+            }
+        }
+    }
+
+    private static void collectAllIndexedDbRoots(File dataDir, List<File> outDirs, List<String> outNames) {
+        if (dataDir == null || !dataDir.isDirectory()) {
+            return;
+        }
+        File[] topEntries = dataDir.listFiles();
+        if (topEntries == null) {
+            return;
+        }
+        Arrays.sort(topEntries, (a, b) -> a.getName().compareTo(b.getName()));
+        for (File entry : topEntries) {
+            if (entry.isDirectory() && entry.getName().toLowerCase(Locale.ROOT).contains("webview")) {
+                collectIndexedDbRoots(entry, "", 0, outDirs, outNames);
+            }
+        }
+    }
+
+    private static void addDirectoryToZip(
+        ZipOutputStream zos,
+        File dir,
+        String zipPrefix,
+        int depth,
+        List<String> skipped,
+        long[] statsOut
+    ) throws IOException {
+        if (dir == null || depth > 14 || !dir.exists() || isSymbolicLink(dir)) {
+            return;
+        }
+        if (dir.isFile()) {
+            if ("LOCK".equals(dir.getName())) {
+                return;
+            }
+            InputStream fis;
+            try {
+                fis = new BufferedInputStream(new FileInputStream(dir));
+            } catch (IOException e) {
+                skipped.add(zipPrefix + ": " + (e.getMessage() != null ? e.getMessage() : "read error"));
+                return;
+            }
+            byte[] buf = new byte[16384];
+            long copied = 0L;
+            boolean entryOpen = false;
+            boolean readFailed = false;
+            try (InputStream stream = fis) {
+                ZipEntry entry = new ZipEntry(zipPrefix);
+                zos.putNextEntry(entry);
+                entryOpen = true;
+                while (true) {
+                    int r;
+                    try {
+                        r = stream.read(buf);
+                    } catch (IOException readError) {
+                        readFailed = true;
+                        skipped.add(
+                            zipPrefix
+                                + ": "
+                                + (readError.getMessage() != null ? readError.getMessage() : "read error")
+                        );
+                        break;
+                    }
+                    if (r == -1) {
+                        break;
+                    }
+                    zos.write(buf, 0, r);
+                    copied += r;
+                }
+                zos.closeEntry();
+                entryOpen = false;
+                if (!readFailed) {
+                    statsOut[0] += 1L;
+                }
+                statsOut[1] += copied;
+            } finally {
+                if (entryOpen) {
+                    try {
+                        zos.closeEntry();
+                    } catch (IOException ignored) {
+                        // ignore closeEntry failure when stream is already broken
+                    }
+                }
+            }
+            return;
+        }
+        File[] children = dir.listFiles();
+        if (children == null) {
+            return;
+        }
+        for (File child : children) {
+            String nextPrefix = zipPrefix.isEmpty() ? child.getName() : zipPrefix + "/" + child.getName();
+            addDirectoryToZip(zos, child, nextPrefix, depth + 1, skipped, statsOut);
+        }
+    }
+
+    private void handleBackupRequest(
+        String method,
+        String requestPath,
+        long contentLength,
+        boolean isChunked,
+        BufferedInputStream in,
+        OutputStream out,
+        String corsOrigin
+    ) throws IOException {
+        String path = stripQuery(requestPath);
+        if ("/__deepchat_backup/xray".equals(path) && "GET".equals(method)) {
+            File dataDir = getFilesDir().getParentFile();
+            long totalDataBytes = 0L;
+            StringBuilder foldersJson = new StringBuilder();
+            StringBuilder idbJson = new StringBuilder();
+
+            if (dataDir != null && dataDir.isDirectory()) {
+                File[] topEntries = dataDir.listFiles();
+                if (topEntries != null) {
+                    Arrays.sort(topEntries, (a, b) -> a.getName().compareTo(b.getName()));
+                    for (File entry : topEntries) {
+                        long[] stats = new long[2];
+                        measureDirStats(entry, 0, stats);
+                        totalDataBytes += stats[0];
+                        if (stats[0] <= 0L && stats[1] <= 0L) {
+                            continue;
+                        }
+                        if (foldersJson.length() > 0) {
+                            foldersJson.append(',');
+                        }
+                        foldersJson
+                            .append("{\"name\":\"")
+                            .append(escapeJson(entry.getName()))
+                            .append("\",\"bytes\":")
+                            .append(stats[0])
+                            .append(",\"files\":")
+                            .append(stats[1])
+                            .append('}');
+                    }
+                }
+
+                List<File> idbRoots = new ArrayList<>();
+                List<String> idbNames = new ArrayList<>();
+                collectAllIndexedDbRoots(dataDir, idbRoots, idbNames);
+                for (int i = 0; i < idbRoots.size(); i++) {
+                    File idbRoot = idbRoots.get(i);
+                    String idbRel = idbNames.get(i);
+                    File[] subEntries = idbRoot.listFiles();
+                    if (subEntries == null || subEntries.length == 0) {
+                        long[] stats = new long[2];
+                        measureDirStats(idbRoot, 0, stats);
+                        if (idbJson.length() > 0) {
+                            idbJson.append(',');
+                        }
+                        idbJson
+                            .append("{\"name\":\"")
+                            .append(escapeJson(idbRel))
+                            .append("\",\"bytes\":")
+                            .append(stats[0])
+                            .append(",\"files\":")
+                            .append(stats[1])
+                            .append('}');
+                        continue;
+                    }
+                    Arrays.sort(subEntries, (a, b) -> a.getName().compareTo(b.getName()));
+                    for (File sub : subEntries) {
+                        long[] stats = new long[2];
+                        measureDirStats(sub, 0, stats);
+                        if (idbJson.length() > 0) {
+                            idbJson.append(',');
+                        }
+                        idbJson
+                            .append("{\"name\":\"")
+                            .append(escapeJson(idbRel + "/" + sub.getName()))
+                            .append("\",\"bytes\":")
+                            .append(stats[0])
+                            .append(",\"files\":")
+                            .append(stats[1])
+                            .append('}');
+                    }
+                }
+            }
+
+            sendJsonOk(
+                out,
+                "{\"totalDataBytes\":"
+                    + totalDataBytes
+                    + ",\"folders\":["
+                    + foldersJson
+                    + "],\"idbFolders\":["
+                    + idbJson
+                    + "]}",
+                corsOrigin
+            );
+            return;
+        }
+
+        if ("/__deepchat_backup/export_raw_idb".equals(path) && "POST".equals(method)) {
+            File dataDir = getFilesDir().getParentFile();
+            List<File> idbRoots = new ArrayList<>();
+            List<String> idbNames = new ArrayList<>();
+            collectAllIndexedDbRoots(dataDir, idbRoots, idbNames);
+            if (idbRoots.isEmpty()) {
+                sendJsonError(out, 404, "No IndexedDB folder found", corsOrigin);
+                return;
+            }
+
+            String stamp = new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(new Date());
+            String safeZipName = "deepchat_raw_idb-" + stamp + ".zip";
+            File exportDir = new File(getCacheDir(), "exports");
+            if (!exportDir.exists()) {
+                //noinspection ResultOfMethodCallIgnored
+                exportDir.mkdirs();
+            }
+            File tempZip = new File(exportDir, System.currentTimeMillis() + "_" + safeZipName);
+            boolean handedOff = false;
+            try {
+                List<String> skipped = new ArrayList<>();
+                long[] zipStats = new long[2];
+                try (ZipOutputStream zos = new ZipOutputStream(new FileOutputStream(tempZip))) {
+                    zos.setLevel(Deflater.BEST_SPEED);
+                    for (int i = 0; i < idbRoots.size(); i++) {
+                        addDirectoryToZip(zos, idbRoots.get(i), idbNames.get(i), 0, skipped, zipStats);
+                    }
+                    StringBuilder manifest = new StringBuilder();
+                    manifest.append("files=").append(zipStats[0]).append('\n');
+                    manifest.append("rawBytes=").append(zipStats[1]).append('\n');
+                    if (!skipped.isEmpty()) {
+                        manifest.append("skipped:\n");
+                        for (String line : skipped) {
+                            manifest.append(line).append('\n');
+                        }
+                    }
+                    zos.putNextEntry(new ZipEntry("export_manifest.txt"));
+                    zos.write(manifest.toString().getBytes(StandardCharsets.UTF_8));
+                    zos.closeEntry();
+                    zos.flush();
+                }
+                saveTempFileToDownloads(tempZip, safeZipName, "application/zip", out, corsOrigin);
+                handedOff = true;
+            } finally {
+                boolean ownedByPicker;
+                synchronized (saveFileLock) {
+                    ownedByPicker = pendingSaveFile == tempZip;
+                }
+                if (!handedOff && !ownedByPicker && tempZip.exists()) {
+                    //noinspection ResultOfMethodCallIgnored
+                    tempZip.delete();
+                }
+            }
+            return;
+        }
+
+        if ("/__deepchat_backup/list".equals(path) && "GET".equals(method)) {
+            StringBuilder ids = new StringBuilder();
+            long totalBytes = 0L;
+            synchronized (backupLock) {
+                File dir = getBackupDir();
+                File[] files = dir.listFiles();
+                if (files != null) {
+                    for (File f : files) {
+                        if (!f.isFile()) {
+                            continue;
+                        }
+                        String name = f.getName();
+                        if (!name.endsWith(".json")) {
+                            continue;
+                        }
+                        String id = sanitizeBackupSessionId(name.substring(0, name.length() - 5));
+                        if (id == null) {
+                            continue;
+                        }
+                        if (ids.length() > 0) {
+                            ids.append(',');
+                        }
+                        ids.append('"').append(escapeJson(id)).append('"');
+                        totalBytes += f.length();
+                    }
+                }
+            }
+            sendJsonOk(out, "{\"sessions\":[" + ids + "],\"totalBytes\":" + totalBytes + "}", corsOrigin);
+            return;
+        }
+
+        if ("/__deepchat_backup/clear".equals(path) && "POST".equals(method)) {
+            synchronized (backupLock) {
+                File[] files = getBackupDir().listFiles();
+                if (files != null) {
+                    for (File f : files) {
+                        if (f.isFile() && (f.getName().endsWith(".json") || f.getName().endsWith(".tmp"))) {
+                            //noinspection ResultOfMethodCallIgnored
+                            f.delete();
+                        }
+                    }
+                }
+            }
+            sendJsonOk(out, "{\"ok\":true}", corsOrigin);
+            return;
+        }
+
+        if ("/__deepchat_backup/session".equals(path)) {
+            String sessionId = sanitizeBackupSessionId(getQueryParam(requestPath, "id"));
+            if (sessionId == null) {
+                sendJsonError(out, 400, "Invalid session id", corsOrigin);
+                return;
+            }
+            File dir = getBackupDir();
+            File target = new File(dir, sessionId + ".json");
+
+            if ("GET".equals(method)) {
+                byte[] snapshot;
+                synchronized (backupLock) {
+                    if (!target.isFile()) {
+                        sendJsonError(out, 404, "Backup not found", corsOrigin);
+                        return;
+                    }
+                    long len = target.length();
+                    if (len <= 0L || len > MAX_BACKUP_SESSION_BYTES) {
+                        sendJsonError(out, 404, "Invalid backup size", corsOrigin);
+                        return;
+                    }
+                    snapshot = new byte[(int) len];
+                    try (InputStream fis = new BufferedInputStream(new FileInputStream(target))) {
+                        int offset = 0;
+                        while (offset < snapshot.length) {
+                            int r = fis.read(snapshot, offset, snapshot.length - offset);
+                            if (r < 0) {
+                                break;
+                            }
+                            offset += r;
+                        }
+                        if (offset < snapshot.length) {
+                            snapshot = Arrays.copyOf(snapshot, offset);
+                        }
+                    }
+                }
+                String header = "HTTP/1.1 200 OK\r\n"
+                    + "Content-Type: application/json; charset=utf-8\r\n"
+                    + "Content-Length: " + snapshot.length + "\r\n"
+                    + "Access-Control-Allow-Origin: " + corsOrigin + "\r\n"
+                    + "Vary: Origin\r\n"
+                    + "Access-Control-Expose-Headers: *\r\n"
+                    + "x-local-proxy: 1\r\n"
+                    + "Connection: close\r\n\r\n";
+                out.write(header.getBytes(StandardCharsets.ISO_8859_1));
+                out.write(snapshot);
+                out.flush();
+                return;
+            }
+
+            if ("POST".equals(method)) {
+                if (!isChunked && (contentLength <= 0L || contentLength > MAX_BACKUP_SESSION_BYTES)) {
+                    sendJsonError(out, contentLength > MAX_BACKUP_SESSION_BYTES ? 413 : 400, "Invalid backup body length", corsOrigin);
+                    return;
+                }
+                File tmp = new File(dir, sessionId + ".json." + UUID.randomUUID() + ".tmp");
+                try {
+                    try (FileOutputStream fos = new FileOutputStream(tmp)) {
+                        if (isChunked) {
+                            byte[] chunked = readChunkedBody(in, MAX_BACKUP_SESSION_BYTES);
+                            if (chunked.length == 0) {
+                                throw new IOException("Empty backup body");
+                            }
+                            fos.write(chunked);
+                        } else {
+                            byte[] buf = new byte[16384];
+                            long remaining = contentLength;
+                            while (remaining > 0L) {
+                                int toRead = (int) Math.min(buf.length, remaining);
+                                int r = in.read(buf, 0, toRead);
+                                if (r < 0) {
+                                    throw new IOException("Unexpected EOF in backup body");
+                                }
+                                fos.write(buf, 0, r);
+                                remaining -= r;
+                            }
+                        }
+                        fos.flush();
+                    }
+                    synchronized (backupLock) {
+                        if (!tmp.renameTo(target)) {
+                            if (target.exists() && !target.delete()) {
+                                throw new IOException("Cannot replace existing backup");
+                            }
+                            if (!tmp.renameTo(target)) {
+                                throw new IOException("Cannot commit backup file");
+                            }
+                        }
+                    }
+                    sendJsonOk(out, "{\"ok\":true}", corsOrigin);
+                } finally {
+                    if (tmp.exists()) {
+                        //noinspection ResultOfMethodCallIgnored
+                        tmp.delete();
+                    }
+                }
+                return;
+            }
+
+            if ("DELETE".equals(method)) {
+                synchronized (backupLock) {
+                    if (target.exists()) {
+                        //noinspection ResultOfMethodCallIgnored
+                        target.delete();
+                    }
+                }
+                sendJsonOk(out, "{\"ok\":true}", corsOrigin);
+                return;
+            }
+        }
+
+        sendJsonError(out, 404, "Unknown backup endpoint", corsOrigin);
     }
 
     private static void sendJsonOk(OutputStream out, String json, String corsOrigin) throws IOException {

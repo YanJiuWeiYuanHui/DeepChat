@@ -14,10 +14,13 @@ import {
   type ArchiveEntry,
 } from './zipReader.js'
 
-const SESSION_BATCH_SIZE = 100
+const SESSION_BATCH_SIZE = 25
+const SESSION_BATCH_MAX_BYTES = 2 * 1024 * 1024
 const FILE_BATCH_MAX_COUNT = 40
 const FILE_BATCH_MAX_BYTES = 8 * 1024 * 1024
 const DEFERRED_IMAGE_MAX_BYTES = 64 * 1024 * 1024
+
+const yieldMainThread = () => new Promise<void>((resolve) => setTimeout(resolve, 0))
 
 /** 从原件字节补充图片 MIME；无法识别时为空字符串，图片身份仍由归档的 is_image 决定。 */
 const imageType = (bytes: Uint8Array): string => {
@@ -126,6 +129,7 @@ export const importArchive = async (
   let index: SessionIndexEntry[] | undefined
   let rootPrefix: string | null = knownRootPrefix ?? null
   let sessionBatch: Session[] = []
+  let sessionBatchBytes = 0
   let fileBatch: db.StoredFile[] = []
   let fileBatchBytes = 0
 
@@ -135,6 +139,7 @@ export const importArchive = async (
     }
     const batch = sessionBatch
     sessionBatch = []
+    sessionBatchBytes = 0
     await db.addStagingSessions(batch)
   }
 
@@ -197,6 +202,7 @@ export const importArchive = async (
           fail('backupIncomplete')
         }
         imported.add(sessionId)
+        onProgress?.(imported.size)
         for (const [imagePath, id] of local.images) {
           images.set(imagePath, id)
           const pending = deferredImages.get(imagePath)
@@ -207,10 +213,16 @@ export const importArchive = async (
           }
         }
         sessionBatch.push(local.session)
-        if (sessionBatch.length >= SESSION_BATCH_SIZE) {
+        sessionBatchBytes += entry.size
+        if (
+          sessionBatch.length >= SESSION_BATCH_SIZE ||
+          sessionBatchBytes >= SESSION_BATCH_MAX_BYTES
+        ) {
           await flushSessions()
+          await yieldMainThread()
+        } else if (imported.size % 10 === 0) {
+          await yieldMainThread()
         }
-        onProgress?.(imported.size)
       } else if (path === INDEX_PATH && !index) {
         index = readSessionIndex(await readJson(entry))
       } else if (fileDirMatch) {

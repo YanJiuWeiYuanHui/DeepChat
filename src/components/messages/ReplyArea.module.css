@@ -2,6 +2,14 @@
   margin-bottom: 10px;
 }
 
+.stepsStreaming {
+  max-height: 220px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding-right: 4px;
+  scrollbar-color: var(--scroll-color) transparent;
+}
+
 .title {
   display: flex;
   align-items: center;
